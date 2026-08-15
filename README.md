@@ -113,9 +113,13 @@ entity references and code content must match byte for byte.
 
 As an independent check, rendering the 206 KB spec document itself produces
 **output byte-identical to `cmark 0.31.2`**, and `scripts/fuzz-oracle.py`
-differentially fuzzes the two parsers (mutated spec examples plus spliced
-fragments); the last 22,500 generated inputs produced no unexplained
-disagreement. Speed is within 3× of cmark: 2 MB of markdown in 0.03 s.
+differentially fuzzes the two parsers on mutated spec examples and spliced
+fragments. Over 38,000 generated inputs, every difference from cmark was either
+a GFM extension cmark does not have, or one of six places where **cmark departs
+from commonmark.js** — the spec's own reference implementation, which produces
+this package's output byte for byte in each of them. The fuzzer can settle such
+a case itself: `--js "node scripts/js-oracle.js"` renders the same input with
+commonmark.js. Speed is within 3× of cmark: 2 MB of markdown in 0.03 s.
 
 ### What is not implemented
 

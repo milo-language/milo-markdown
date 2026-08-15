@@ -4,3 +4,8 @@ milo.lock
 *.ll
 *.dSYM/
 __pycache__/
+node_modules/
+package.json
+package-lock.json
+bun.lock
+bun.lockb

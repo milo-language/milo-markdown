@@ -13,7 +13,10 @@ HTML is compared with the same normalisation the spec oracle uses.
 
 cmark 0.31.2 does not implement GFM, so tables, strikethrough, task lists and
 bare-URL autolinks make the two disagree *by design*. Those diffs are detected
-and counted separately; anything else is a finding and fails the run.
+and counted separately, as are the handful of places where cmark itself departs
+from commonmark.js (see `known_divergence`). Anything left is unadjudicated and
+fails the run — cmark is a second opinion, not the spec, so settle it by passing
+`--js "node scripts/js-oracle.js"` and believing the reference implementation.
 """
 
 import argparse
@@ -23,6 +26,7 @@ import re
 import shlex
 import subprocess
 import sys
+import html as html_mod
 import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -122,6 +126,16 @@ def known_divergence(ours, theirs):
        anyway and swallows the paragraph.
     4. comment-tail          a stray `-->` after a comment is text and gets
        escaped; cmark emits it raw.
+    5. raw-html-scanning     cmark rejects some raw-HTML constructs the spec's
+       grammar accepts (`<![CDATA[>&<]]]>`) and escapes them as text instead.
+    6. backtick-cache        cmark caches "no closing run of length N" per
+       subject and stops finding later code spans; commonmark.js re-scans and
+       finds them, as the spec's rule requires.
+
+    A diff outside this list is a finding and fails the run. Before adding an
+    entry here, adjudicate it: run the input through commonmark.js (npm i
+    commonmark) and only excuse the difference if commonmark.js produces our
+    output exactly.
     """
     a, b = ours, theirs
     if _trim_url_edge_ws(a) == _trim_url_edge_ws(b):
@@ -136,6 +150,15 @@ def known_divergence(ours, theirs):
         return "title-rewind"
     if a.replace("--&gt;", "-->") == b.replace("--&gt;", "-->"):
         return "comment-tail"
+    if "<![CDATA[" in a or "<!--" in a or "<?" in a:
+        # `]+>` is squeezed because the normaliser's own CDATA handling drops a
+        # bracket; everything else in the comparison is exact.
+        squeeze = lambda h: re.sub(r"\]+>", "]>", html_mod.unescape(h))
+        if squeeze(a) == squeeze(b):
+            return "raw-html-scanning"
+    strip_code = lambda h: html_mod.unescape(re.sub(r"</?code>|`", "", h))
+    if a.count("<code>") > b.count("<code>") and strip_code(a) == strip_code(b):
+        return "backtick-cache"
     return None
 
 
@@ -157,6 +180,9 @@ def main():
     ap.add_argument("--n", type=int, default=400)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--show", type=int, default=3)
+    ap.add_argument("--js", default=None,
+                    help="command that renders markdown from stdin with commonmark.js; "
+                         "findings it agrees with us on are reported separately")
     args = ap.parse_args()
 
     milo = shlex.split(args.milo)
@@ -208,6 +234,12 @@ def main():
             known += 1
             known_classes[cls] = known_classes.get(cls, 0) + 1
             continue
+        if args.js:
+            js = subprocess.run(shlex.split(args.js), input=case, capture_output=True, text=True).stdout
+            if spec_oracle.normalize(js) == spec_oracle.normalize(ours):
+                known += 1
+                known_classes["adjudicated-by-commonmark.js"] = known_classes.get("adjudicated-by-commonmark.js", 0) + 1
+                continue
         findings.append((case, ours, theirs))
 
     print("%s vs milo-markdown: %d cases (seed %d)" % (version, len(cases), args.seed))
@@ -215,7 +247,11 @@ def main():
     print("  differ (GFM by design) %d" % gfm_diffs)
     detail = " (%s)" % ", ".join("%s x%d" % kv for kv in sorted(known_classes.items())) if known_classes else ""
     print("  differ (known, we follow commonmark.js) %d%s" % (known, detail))
-    print("  differ (findings)      %d" % len(findings))
+    print("  differ (unadjudicated) %d" % len(findings))
+    if findings and not args.js:
+        print("\n  unadjudicated means only that cmark disagrees. Settle it against the\n"
+              "  reference implementation before believing either side:\n"
+              "    npm i commonmark && %s --js \"node scripts/js-oracle.js\"" % sys.argv[0])
     for case, ours, theirs in findings[:args.show]:
         print("\n--- input   : %r" % case)
         print("    cmark   : %r" % theirs)
