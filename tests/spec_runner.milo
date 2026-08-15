@@ -1,0 +1,74 @@
+// Render markdown to HTML for the conformance oracle.
+//
+//   milo run tests/spec_runner.milo file.md      render one file
+//   milo run tests/spec_runner.milo              render stdin
+//   milo run tests/spec_runner.milo --batch f    render many documents at once
+//
+// Batch mode exists because the spec has 655 examples and starting a process per
+// example is slower than the whole parse: the file holds the documents separated
+// by a line reading exactly @@@MILO-MD-SPLIT@@@, and the output separates the
+// rendered documents the same way.
+
+from "../lib" import {
+    mdToHtml
+}
+from "std/fs" import {
+    readFile
+}
+from "std/io" import {
+    readStdin, writeStdout
+}
+from "std/args" import {
+    args
+}
+
+fn separator(): string {
+    return "@@@MILO-MD-SPLIT@@@"
+}
+
+fn main(): i32 {
+    let argv = args()
+    var batch = false
+    var path = ""
+    for i in 1..argv.len {
+        if argv[i] == "--batch" {
+            batch = true
+        } else {
+            path = argv[i].clone()
+        }
+    }
+
+    var source = ""
+    if path.len > 0 {
+        source = match readFile(path) {
+            Result.Ok(text) => {
+                text
+            }
+            Result.Err(e) => {
+                print($"cannot read {path}: {e}")
+                return 1
+            }
+        }
+    } else {
+        source = readStdin()
+    }
+
+    if !batch {
+        writeStdout(mdToHtml(source))
+        return 0
+    }
+
+    let sep = separator()
+    let parts = source.split("\n" + sep + "\n")
+    var out = ""
+    for i in 0..parts.len {
+        if i > 0 {
+            out.pushStr("\n")
+            out.pushStr(sep)
+            out.pushStr("\n")
+        }
+        out.pushStr(mdToHtml(parts[i]))
+    }
+    writeStdout(out)
+    return 0
+}

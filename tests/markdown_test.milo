@@ -1,0 +1,257 @@
+// Unit tests for the parts the CommonMark spec suite cannot grade: the GFM
+// extensions (spec.txt has no tables, strikethrough, task lists or bare-URL
+// autolinks), HTML escaping, and the tree API a docs generator or a link
+// checker walks. CommonMark itself is covered by scripts/spec-oracle.py, which
+// scores all 655 spec examples and ratchets the result.
+
+from "../lib" import {
+    mdToHtml, escapeHtml, Markdown, NodeKind, Align
+}
+from "std/testing" import {
+    assertStrEqual, assertMsg, assertEqual64
+}
+
+fn render(src: string): string {
+    return mdToHtml(src)
+}
+
+// ── GFM: tables ──────────────────────────────────────────────────────────────
+
+fn testTableBasic() {
+    let html = render("| a | b |\n| - | - |\n| 1 | 2 |\n")
+    assertStrEqual(html, "<table>\n<thead>\n<tr>\n<th>a</th>\n<th>b</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>1</td>\n<td>2</td>\n</tr>\n</tbody>\n</table>\n")
+}
+
+fn testTableAlignment() {
+    let html = render("| l | c | r | n |\n| :- | :-: | -: | - |\n| 1 | 2 | 3 | 4 |\n")
+    assertMsg(html.contains("<th align=\"left\">l</th>"), "left aligned header")
+    assertMsg(html.contains("<th align=\"center\">c</th>"), "center aligned header")
+    assertMsg(html.contains("<th align=\"right\">r</th>"), "right aligned header")
+    assertMsg(html.contains("<th>n</th>"), "unaligned header has no attribute")
+    assertMsg(html.contains("<td align=\"center\">2</td>"), "body cell inherits the column alignment")
+}
+
+fn testTableRaggedRows() {
+    // GFM pads a short row and truncates a long one to the header's width.
+    let html = render("| a | b |\n| - | - |\n| 1 |\n| 1 | 2 | 3 |\n")
+    assertMsg(html.contains("<tr>\n<td>1</td>\n<td></td>\n</tr>"), "short row is padded")
+    assertMsg(html.contains("<tr>\n<td>1</td>\n<td>2</td>\n</tr>"), "long row is truncated")
+    assertMsg(!html.contains("<td>3</td>"), "the extra cell is dropped")
+}
+
+fn testTableInlineContentAndEscapedPipe() {
+    let html = render("| a | b |\n| - | - |\n| *x* | `y\\|z` |\n")
+    assertMsg(html.contains("<td><em>x</em></td>"), "cells parse inlines")
+    // A pipe inside a code span still splits cells unless it is escaped; the
+    // backslash is what makes it content.
+    assertMsg(html.contains("<td><code>y|z</code></td>"), "escaped pipe stays in the cell")
+}
+
+fn testTableNeedsMatchingDelimiterRow() {
+    // Three header cells, two delimiter cells: not a table.
+    let html = render("| a | b | c |\n| - | - |\n")
+    assertMsg(!html.contains("<table>"), "mismatched delimiter row is not a table")
+    // A delimiter row with no pipe is a setext heading underline, not a table.
+    assertStrEqual(render("a\n---\n"), "<h2>a</h2>\n")
+}
+
+fn testTableEndsAtBlankLineAndBlock() {
+    let html = render("| a |\n| - |\n| 1 |\n\nafter\n")
+    assertMsg(html.contains("</table>\n<p>after</p>"), "blank line ends the table")
+    let html2 = render("| a |\n| - |\n| 1 |\n# head\n")
+    assertMsg(html2.contains("</table>\n<h1>head</h1>"), "a heading ends the table")
+}
+
+// ── GFM: strikethrough, task lists, autolinks ────────────────────────────────
+
+fn testStrikethrough() {
+    assertStrEqual(render("~~gone~~\n"), "<p><del>gone</del></p>\n")
+    assertStrEqual(render("~one~\n"), "<p><del>one</del></p>\n")
+    // Runs longer than two are literal, and unmatched lengths do not pair.
+    // (`~~~x~~~` on its own line is a tilde code fence, not strikethrough.)
+    assertStrEqual(render("a ~~~x~~~ b\n"), "<p>a ~~~x~~~ b</p>\n")
+    assertStrEqual(render("~~x~\n"), "<p>~~x~</p>\n")
+    assertStrEqual(render("a ~~b *c* d~~ e\n"), "<p>a <del>b <em>c</em> d</del> e</p>\n")
+}
+
+fn testTaskLists() {
+    let html = render("- [ ] todo\n- [x] done\n- [X] also done\n- plain\n")
+    assertMsg(html.contains("<li><input type=\"checkbox\" disabled=\"\" /> todo</li>"), "unchecked box")
+    assertMsg(html.contains("<li><input type=\"checkbox\" checked=\"\" disabled=\"\" /> done</li>"), "checked box")
+    assertMsg(html.contains("<li><input type=\"checkbox\" checked=\"\" disabled=\"\" /> also done</li>"), "uppercase X is checked")
+    assertMsg(html.contains("<li>plain</li>"), "a plain item is untouched")
+    // The marker only counts at the start of the item.
+    assertMsg(!render("- not [ ] a task\n").contains("checkbox"), "marker must lead the item")
+}
+
+fn testExtendedAutolinks() {
+    assertStrEqual(render("www.example.com\n"), "<p><a href=\"http://www.example.com\">www.example.com</a></p>\n")
+    assertStrEqual(render("https://a.b/c\n"), "<p><a href=\"https://a.b/c\">https://a.b/c</a></p>\n")
+    // Trailing sentence punctuation is not part of the link.
+    assertStrEqual(render("see https://a.b/c.\n"), "<p>see <a href=\"https://a.b/c\">https://a.b/c</a>.</p>\n")
+    // A closing paren is part of it only when it balances one inside.
+    assertStrEqual(render("(see https://a.b/c)\n"), "<p>(see <a href=\"https://a.b/c\">https://a.b/c</a>)</p>\n")
+    assertMsg(render("https://a.b/x_(y)\n").contains("href=\"https://a.b/x_(y)\""), "balanced parens stay in")
+    // Not a link: no dot in the domain, or mid-word.
+    assertMsg(!render("www\n").contains("<a "), "www alone is not a link")
+    assertMsg(!render("xhttps://a.b\n").contains("<a "), "a url must start at a boundary")
+    // A bare URL inside a link's text must not become a nested link.
+    let nested = render("[x https://a.b/c y](/u)\n")
+    assertStrEqual(nested, "<p><a href=\"/u\">x https://a.b/c y</a></p>\n")
+}
+
+// ── HTML escaping ────────────────────────────────────────────────────────────
+
+fn testTextEscaping() {
+    // The four characters cmark escapes in text. `'` is deliberately not one:
+    // nothing here emits a single-quoted attribute.
+    assertStrEqual(render("a & b < c > d \" e ' f\n"), "<p>a &amp; b &lt; c &gt; d &quot; e ' f</p>\n")
+    assertStrEqual(escapeHtml("<script>alert(1)</script>"), "&lt;script&gt;alert(1)&lt;/script&gt;")
+    // Code spans and code blocks escape the same way.
+    assertStrEqual(render("`<b>&</b>`\n"), "<p><code>&lt;b&gt;&amp;&lt;/b&gt;</code></p>\n")
+    assertStrEqual(render("    <b>&\n"), "<pre><code>&lt;b&gt;&amp;\n</code></pre>\n")
+}
+
+fn testAttributeEscaping() {
+    // A quote in a destination must not close the attribute.
+    assertStrEqual(render("[x](/a\"onmouseover=alert(1))\n"), "<p><a href=\"/a%22onmouseover=alert(1)\">x</a></p>\n")
+    // Nor may a title, an alt text, or an info string.
+    assertMsg(render("[x](/u \"a\\\"b\")\n").contains("title=\"a&quot;b\""), "title quote is escaped")
+    assertMsg(render("![\"alt\"](/i)\n").contains("alt=\"&quot;alt&quot;\""), "alt quote is escaped")
+    assertMsg(render("```x\"y\n```\n").contains("class=\"language-x&quot;y\""), "info string quote is escaped")
+    // Raw inline HTML inside an image description is text in the alt, escaped —
+    // not markup that lands inside the attribute.
+    assertMsg(render("![a<b>c](/i)\n").contains("alt=\"a&lt;b&gt;c\""), "alt html is escaped")
+}
+
+fn testHrefEncoding() {
+    // Angle brackets and spaces are percent-encoded, `&` and `'` become
+    // references: all four can otherwise break out of the attribute.
+    assertMsg(render("[x](</a b>)\n").contains("href=\"/a%20b\""), "space is encoded")
+    assertMsg(render("[x](/a?b=1&c=2)\n").contains("href=\"/a?b=1&amp;c=2\""), "ampersand is a reference")
+    assertMsg(render("[x](/a'b)\n").contains("href=\"/a&#x27;b\""), "apostrophe is a reference")
+    assertMsg(render("[x](/a\\<b)\n").contains("href=\"/a%3Cb\""), "angle bracket is encoded")
+    // An existing percent escape is left alone rather than double-encoded.
+    assertMsg(render("[x](/a%20b)\n").contains("href=\"/a%20b\""), "percent escapes survive")
+    // Non-ASCII is UTF-8 percent-encoded.
+    assertMsg(render("[x](/é)\n").contains("href=\"/%C3%A9\""), "utf-8 is encoded")
+    assertMsg(render("![x](/i\"onerror=alert(1))\n").contains("src=\"/i%22onerror=alert(1)\""), "image src is encoded")
+}
+
+fn testRawHtmlPassesThrough() {
+    // CommonMark says raw HTML is raw HTML. This is the one place output is not
+    // escaped, so the tree exposes it as HtmlBlock/HtmlInline for callers that
+    // need to filter or sanitize it.
+    assertStrEqual(render("<div onclick=\"x\">hi</div>\n"), "<div onclick=\"x\">hi</div>\n")
+    let doc = Markdown.parse("<div>hi</div>\n")
+    let node = doc.at(doc.root(), 0)
+    assertMsg(doc.kind(node) as i32 == NodeKind.HtmlBlock as i32, "raw html is visible as HtmlBlock")
+}
+
+// ── Tree API ─────────────────────────────────────────────────────────────────
+
+fn testTreeWalkHeadings() {
+    // What a docs generator does: pull the headings out.
+    let doc = Markdown.parse("# One\n\ntext\n\n## Two *bold*\n\n### Three\n")
+    var titles = ""
+    for i in 0..doc.len(doc.root()) {
+        let n = doc.at(doc.root(), i)
+        if doc.kind(n) as i32 == NodeKind.Heading as i32 {
+            titles.pushStr($"{doc.level(n)}:{doc.innerText(n)};")
+        }
+    }
+    assertStrEqual(titles, "1:One;2:Two bold;3:Three;")
+}
+
+fn testTreeWalkLinks() {
+    // What a link checker does: collect every destination, at any depth.
+    let doc = Markdown.parse("[a](/one)\n\n> - [b](/two \"t\")\n>   ![c](/three)\n")
+    var found = ""
+    collectLinks(doc, doc.root(), found)
+    assertStrEqual(found, "/one|/two|/three|")
+    let link = doc.at(doc.at(doc.root(), 0), 0)
+    assertStrEqual(doc.dest(link), "/one")
+    assertStrEqual(doc.text(doc.at(link, 0)), "a")
+}
+
+fn collectLinks(doc: &Markdown, node: i64, out: &mut string) {
+    let k = doc.kind(node) as i32
+    if k == NodeKind.Link as i32 || k == NodeKind.Image as i32 {
+        out.pushStr(doc.dest(node))
+        out.push('|')
+    }
+    for i in 0..doc.len(node) {
+        collectLinks(doc, doc.at(node, i), out)
+    }
+}
+
+fn testTreeShape() {
+    let doc = Markdown.parse("# h\n\n- a\n- b\n\n```rust\ncode\n```\n")
+    let root = doc.root()
+    assertEqual64(doc.len(root), 3)
+    assertMsg(doc.kind(doc.at(root, 0)) as i32 == NodeKind.Heading as i32, "first child is the heading")
+    let list = doc.at(root, 1)
+    assertMsg(doc.kind(list) as i32 == NodeKind.List as i32, "second child is the list")
+    assertMsg(doc.isTight(list), "a list with no blank lines is tight")
+    assertMsg(!doc.isOrdered(list), "bullet list is not ordered")
+    assertEqual64(doc.len(list), 2)
+    let code = doc.at(root, 2)
+    assertStrEqual(doc.info(code), "rust")
+    assertStrEqual(doc.text(code), "code\n")
+    // A missing handle is absent, not a crash.
+    assertMsg(!doc.exists(doc.at(root, 99)), "out of range child is -1")
+    assertEqual64(doc.len(-1), 0)
+    assertStrEqual(doc.text(-1), "")
+    assertMsg(doc.kind(-1) as i32 == NodeKind.Missing as i32, "a missing handle has kind Missing")
+}
+
+fn testListMetadata() {
+    let doc = Markdown.parse("3. a\n\n4. b\n")
+    let list = doc.at(doc.root(), 0)
+    assertMsg(doc.isOrdered(list), "ordered list")
+    assertEqual64(doc.level(list), 3)
+    assertMsg(!doc.isTight(list), "a blank line between items makes the list loose")
+    let tasks = Markdown.parse("- [x] a\n- [ ] b\n- c\n")
+    let tlist = tasks.at(tasks.root(), 0)
+    assertMsg(tasks.isTask(tasks.at(tlist, 0)) && tasks.isChecked(tasks.at(tlist, 0)), "checked task")
+    assertMsg(tasks.isTask(tasks.at(tlist, 1)) && !tasks.isChecked(tasks.at(tlist, 1)), "unchecked task")
+    assertMsg(!tasks.isTask(tasks.at(tlist, 2)), "plain item is not a task")
+}
+
+fn testTableTreeAccess() {
+    let doc = Markdown.parse("| a | b |\n| :- | -: |\n| 1 | 2 |\n")
+    let table = doc.at(doc.root(), 0)
+    assertMsg(doc.kind(table) as i32 == NodeKind.Table as i32, "table node")
+    assertEqual64(doc.len(table), 2)
+    let head = doc.at(table, 0)
+    assertEqual64(doc.len(head), 2)
+    assertMsg(doc.align(doc.at(head, 0)) as i32 == Align.Left as i32, "left alignment")
+    assertMsg(doc.align(doc.at(head, 1)) as i32 == Align.Right as i32, "right alignment")
+    assertStrEqual(doc.innerText(doc.at(doc.at(table, 1), 1)), "2")
+}
+
+// ── Round trip ───────────────────────────────────────────────────────────────
+
+fn testDocumentSmoke() {
+    let src = "# Title\n\nA paragraph with *em*, **strong**, `code`, and a [link](/u \"t\").\n\n" +
+    "> quoted\n> - one\n> - two\n\n```js\nlet x = 1 < 2 && 3 > 2;\n```\n\n" +
+    "| k | v |\n| - | - |\n| a | 1 |\n\n---\n\n<!-- done -->\n"
+    let html = render(src)
+    assertMsg(html.startsWith("<h1>Title</h1>\n"), "heading first")
+    assertMsg(html.contains("<em>em</em>"), "emphasis")
+    assertMsg(html.contains("<strong>strong</strong>"), "strong")
+    assertMsg(html.contains("<a href=\"/u\" title=\"t\">link</a>"), "link with title")
+    assertMsg(html.contains("<blockquote>\n<p>quoted</p>\n<ul>\n<li>one</li>"), "list inside a quote")
+    assertMsg(html.contains("let x = 1 &lt; 2 &amp;&amp; 3 &gt; 2;"), "code block is escaped")
+    assertMsg(html.contains("<hr />"), "thematic break")
+    assertMsg(html.endsWith("<!-- done -->\n"), "raw html last")
+}
+
+fn testEmptyAndOddInput() {
+    assertStrEqual(render(""), "")
+    assertStrEqual(render("\n\n\n"), "")
+    // A NUL is replaced with U+FFFD rather than truncating anything.
+    assertMsg(render("a\u{0}b\n").contains("\u{FFFD}"), "NUL becomes U+FFFD")
+    // CRLF and a bare CR are line endings too.
+    assertStrEqual(render("a\r\nb\r\n"), "<p>a\nb</p>\n")
+}

@@ -1,0 +1,10 @@
+{
+  "name": "markdown",
+  "version": "0.1.0",
+  "description": "CommonMark + GFM markdown parser and HTML renderer",
+  "license": "MIT",
+  "repository": "github.com/milo-language/milo-markdown",
+  "lib": "lib.milo",
+  "targets": ["darwin", "linux", "windows"],
+  "exclude": ["tests/**", "examples/**", "scripts/**"]
+}

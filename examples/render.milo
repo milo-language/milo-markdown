@@ -1,0 +1,83 @@
+// Render a markdown file to HTML, and list what the tree says about it.
+//
+//   milo run examples/render.milo README.md
+//   milo run examples/render.milo README.md --outline
+//
+// The outline mode is the point of the tree being public: the same parse that
+// produces the HTML answers "what are the headings" and "where do the links
+// go" without re-parsing or scraping the output.
+
+from "../lib" import {
+    Markdown, NodeKind
+}
+from "std/fs" import {
+    readFile
+}
+from "std/args" import {
+    args
+}
+
+fn main(): i32 {
+    let argv = args()
+    var path = ""
+    var outline = false
+    for i in 1..argv.len {
+        if argv[i] == "--outline" {
+            outline = true
+        } else {
+            path = argv[i].clone()
+        }
+    }
+    if path.len == 0 {
+        print("usage: render <file.md> [--outline]")
+        return 1
+    }
+
+    let source = match readFile(path) {
+        Result.Ok(text) => {
+            text
+        }
+        Result.Err(e) => {
+            print($"cannot read {path}: {e}")
+            return 1
+        }
+    }
+
+    let doc = Markdown.parse(source)
+    if !outline {
+        print(doc.toHtml())
+        return 0
+    }
+
+    print($"# outline of {path}")
+    walk(doc, doc.root(), 0)
+    return 0
+}
+
+fn walk(doc: &Markdown, node: i64, depth: i64) {
+    let k = doc.kind(node) as i32
+    if k == NodeKind.Heading as i32 {
+        let bar = "#".repeat(doc.level(node))
+        print($"{bar} {doc.innerText(node)}")
+    } else if k == NodeKind.Link as i32 {
+        print($"  link -> {doc.dest(node)}   [{doc.innerText(node)}]")
+    } else if k == NodeKind.Image as i32 {
+        print($"  image -> {doc.dest(node)}")
+    } else if k == NodeKind.CodeBlock as i32 {
+        let info = doc.info(node)
+        var lines: i64 = 0
+        for c in doc.text(node) {
+            if c == '\n' {
+                lines = lines + 1
+            }
+        }
+        if info.len > 0 {
+            print($"  code ({info}, {lines} lines)")
+        } else {
+            print($"  code ({lines} lines)")
+        }
+    }
+    for i in 0..doc.len(node) {
+        walk(doc, doc.at(node, i), depth + 1)
+    }
+}

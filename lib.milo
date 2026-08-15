@@ -1,0 +1,4279 @@
+// markdown — a CommonMark 0.31.2 + GFM parser and HTML renderer for Milo.
+//
+// A document parses into a flat node pool. Every handle is an `i64` index into
+// that pool and **-1 means "not there"**, so a walk that misses is not an error,
+// it is a handle that reads as absent — the same shape `std/json` and the `yaml`
+// package use, and the reason there is no `Option` at every step of a walk.
+//
+// The pool (rather than a recursive enum) is deliberate: Milo has no pointers in
+// safe code, so a self-referential value type would need an arena anyway — and
+// indices make the whole document one contiguous, cheaply-cloned value.
+//
+// The tree is the product, not the HTML. `toHtml` is one consumer of it: a docs
+// generator pulls `Heading` nodes out of the same tree, and a link checker walks
+// `Link`/`Image` nodes for their `dest`. Rendering is a fold over the tree, so
+// anything the renderer can see, a caller can see too.
+//
+// The parse is a port of the CommonMark reference algorithm (commonmark.js):
+// a line-at-a-time block phase that keeps a stack of open containers, then an
+// inline phase per leaf block that uses the delimiter-stack algorithm for
+// emphasis and the bracket stack for links. Regexes are hand-rolled scanners —
+// this package pulls in nothing but the standard library.
+
+from "std/unicode" import {
+    decodeCodepoint, encodeCodepoint
+}
+
+// ── Public node kinds ────────────────────────────────────────────────────────
+
+// The integer repr is the pool's storage; the variant names are the public
+// spelling. Blocks sort below `Text` so `isBlock` is a range check.
+pub enum NodeKind: i32 {
+    Document, // 0
+    BlockQuote, // 1
+    List, // 2
+    Item, // 3
+    CodeBlock, // 4
+    HtmlBlock, // 5
+    Paragraph, // 6
+    Heading, // 7
+    ThematicBreak, // 8
+    Table, // 9  — GFM
+    TableRow, // 10 — GFM
+    TableCell, // 11 — GFM
+    Text, // 12
+    SoftBreak, // 13
+    LineBreak, // 14
+    Code, // 15
+    HtmlInline, // 16
+    Emph, // 17
+    Strong, // 18
+    Strike, // 19 — GFM
+    Link, // 20
+    Image, // 21
+    Missing, // 22 — only an accessor returns it, for an invalid handle
+}
+
+// Cell alignment for a GFM table column.
+pub enum Align: i32 {
+    None, // 0
+    Left, // 1
+    Center, // 2
+    Right, // 3
+}
+
+// One node. Strings live inline rather than in a side pool: a markdown node's
+// literal is its payload (not a shared key), so interning would buy nothing and
+// cost a second index space to get wrong.
+pub struct MdNode {
+    kind: NodeKind,
+    literal: string, // Text/Code/Html literal, CodeBlock body
+    dest: string, // Link/Image destination; CodeBlock info string
+    title: string, // Link/Image title
+    content: string, // parse-time line accumulator; empty once finalized
+
+    level: i64, // Heading level; TableCell alignment; List start number
+    listOrdered: bool,
+    listTight: bool,
+    listDelim: u8, // '-' '*' '+' for bullets, '.' or ')' for ordered
+    listPadding: i64,
+    listMarkerOffset: i64,
+    taskState: i64, // Item: 0 none, 1 unchecked, 2 checked (GFM)
+    isFenced: bool,
+    fenceChar: u8,
+    fenceLen: i64,
+    fenceOffset: i64,
+    htmlBlockType: i64,
+    isHeader: bool, // TableRow/TableCell inside <thead>
+
+    // Parse-time tree links (a doubly-linked child list, which the emphasis
+    // algorithm needs for its unlink/insertAfter dance), flattened into
+    // childStart/childCount once parsing is done.
+    firstChild: i64,
+    lastChild: i64,
+    next: i64,
+    prev: i64,
+    parent: i64,
+    open: bool,
+    lastLineBlank: bool,
+
+    childStart: i64, // offset into Markdown.childIdx
+    childCount: i64,
+}
+
+fn mdNode(kind: NodeKind): MdNode {
+    return MdNode {
+        kind: kind,
+        literal: "",
+        dest: "",
+        title: "",
+        content: "",
+        level: 0,
+        listOrdered: false,
+        listTight: true,
+        listDelim: 0,
+        listPadding: 0,
+        listMarkerOffset: 0,
+        taskState: 0,
+        isFenced: false,
+        fenceChar: 0,
+        fenceLen: 0,
+        fenceOffset: 0,
+        htmlBlockType: 0,
+        isHeader: false,
+        firstChild: -1,
+        lastChild: -1,
+        next: -1,
+        prev: -1,
+        parent: -1,
+        open: true,
+        lastLineBlank: false,
+        childStart: 0,
+        childCount: 0,
+    }
+}
+
+// A parsed document: the node pool, the flattened child index, and the root.
+pub struct Markdown {
+    nodes: Vec<MdNode>,
+    childIdx: Vec<i64>,
+    root: i64,
+}
+
+// The headline API: markdown in, HTML out.
+pub fn mdToHtml(src: &string): string {
+    let doc = Markdown.parse(src.clone())
+    return doc.toHtml()
+}
+
+impl Markdown {
+    // Parse a document. There is no error case — CommonMark has no invalid
+    // input, only input that renders as text.
+    fn parse(src: string): Markdown {
+        var p = MdParser.new()
+        p.parseAll(src)
+        var m = Markdown {
+            nodes: p.nodes, childIdx: Vec.new(), root: p.doc
+        }
+        m.flatten()
+        return m
+    }
+
+    // Turn the parse-time linked child lists into contiguous ranges of
+    // `childIdx`, so `at(i)` is a lookup rather than a walk. Nodes orphaned
+    // during parsing (an unlinked paragraph, a consumed emphasis delimiter) stay
+    // in the pool but are unreachable from the root.
+    fn flatten(self: &mut Self): void {
+        let count = self.nodes.len
+        for i in 0..count {
+            let start = self.childIdx.len
+            var c = self.nodes[i].firstChild
+            var n: i64 = 0
+            while c >= 0 {
+                self.childIdx.push(c)
+                n = n + 1
+                c = self.nodes[c].next
+            }
+            self.nodes[i].childStart = start
+            self.nodes[i].childCount = n
+        }
+    }
+
+    // ── Tree access, in std/json's vocabulary ────────────────────────────────
+
+    fn root(self: &Self): i64 {
+        return self.root
+    }
+
+    // Number of children of `node`; 0 for a leaf or a missing handle.
+    fn len(self: &Self, node: i64): i64 {
+        if node < 0 || node >= self.nodes.len {
+            return 0
+        }
+        return self.nodes[node].childCount
+    }
+
+    // i-th child of `node`, or -1.
+    fn at(self: &Self, node: i64, i: i64): i64 {
+        if node < 0 || node >= self.nodes.len {
+            return -1
+        }
+        if i < 0 || i >= self.nodes[node].childCount {
+            return -1
+        }
+        return self.childIdx[self.nodes[node].childStart + i]
+    }
+
+    fn kind(self: &Self, node: i64): NodeKind {
+        if node < 0 || node >= self.nodes.len {
+            return NodeKind.Missing
+        }
+        return self.nodes[node].kind
+    }
+
+    fn exists(self: &Self, node: i64): bool {
+        return node >= 0 && node < self.nodes.len
+    }
+
+    fn parent(self: &Self, node: i64): i64 {
+        if node < 0 || node >= self.nodes.len {
+            return -1
+        }
+        return self.nodes[node].parent
+    }
+
+    // Literal payload: text, code-span/code-block body, raw HTML. "" elsewhere.
+    fn text(self: &Self, node: i64): string {
+        if node < 0 || node >= self.nodes.len {
+            return ""
+        }
+        return self.nodes[node].literal.clone()
+    }
+
+    // Link/Image destination, or a code block's info string.
+    fn dest(self: &Self, node: i64): string {
+        if node < 0 || node >= self.nodes.len {
+            return ""
+        }
+        return self.nodes[node].dest.clone()
+    }
+
+    fn title(self: &Self, node: i64): string {
+        if node < 0 || node >= self.nodes.len {
+            return ""
+        }
+        return self.nodes[node].title.clone()
+    }
+
+    // A fenced code block's info string -- "rust" for a rust-tagged fence.
+    fn info(self: &Self, node: i64): string {
+        return self.dest(node)
+    }
+
+    // Heading level (1-6), a list's start number, or a table cell's alignment.
+    fn level(self: &Self, node: i64): i64 {
+        if node < 0 || node >= self.nodes.len {
+            return 0
+        }
+        return self.nodes[node].level
+    }
+
+    fn align(self: &Self, node: i64): Align {
+        if node < 0 || node >= self.nodes.len {
+            return Align.None
+        }
+        if self.nodes[node].kind as i32 != NodeKind.TableCell as i32 {
+            return Align.None
+        }
+        let a = self.nodes[node].level
+        if a == 1 {
+            return Align.Left
+        }
+        if a == 2 {
+            return Align.Center
+        }
+        if a == 3 {
+            return Align.Right
+        }
+        return Align.None
+    }
+
+    fn isOrdered(self: &Self, node: i64): bool {
+        if node < 0 || node >= self.nodes.len {
+            return false
+        }
+        return self.nodes[node].listOrdered
+    }
+
+    fn isTight(self: &Self, node: i64): bool {
+        if node < 0 || node >= self.nodes.len {
+            return false
+        }
+        return self.nodes[node].listTight
+    }
+
+    // GFM task list items: `- [ ] a` / `- [x] a`.
+    fn isTask(self: &Self, node: i64): bool {
+        if node < 0 || node >= self.nodes.len {
+            return false
+        }
+        return self.nodes[node].taskState != 0
+    }
+
+    fn isChecked(self: &Self, node: i64): bool {
+        if node < 0 || node >= self.nodes.len {
+            return false
+        }
+        return self.nodes[node].taskState == 2
+    }
+
+    // Every descendant's text content, concatenated — the plain-text rendering
+    // of a subtree. This is what a docs generator wants out of a Heading and
+    // what the renderer uses for an image's alt text.
+    fn innerText(self: &Self, node: i64): string {
+        var out = ""
+        self.innerTextInto(node, out)
+        return out
+    }
+
+    fn innerTextInto(self: &Self, node: i64, out: &mut string): void {
+        if node < 0 || node >= self.nodes.len {
+            return
+        }
+        let k = self.nodes[node].kind as i32
+        // Raw inline HTML counts as text here, and the caller escapes it. That
+        // is cmark's behaviour and the safe one: dropping it would silently
+        // lose content, and passing it through unescaped would put attacker
+        // markup inside an `alt` attribute.
+        if k == NodeKind.Text as i32 || k == NodeKind.Code as i32 || k == NodeKind.HtmlInline as i32 {
+            out.pushStr(self.nodes[node].literal)
+        } else if k == NodeKind.SoftBreak as i32 || k == NodeKind.LineBreak as i32 {
+            out.push('\n')
+        }
+        for i in 0..self.nodes[node].childCount {
+            self.innerTextInto(self.childIdx[self.nodes[node].childStart + i], out)
+        }
+    }
+}
+
+// ── Byte and character classification ────────────────────────────────────────
+//
+// The block scanners work on bytes: every character CommonMark gives structural
+// meaning to is ASCII, and a multi-byte sequence can never collide with one
+// because UTF-8 continuation bytes are all >= 0x80. The inline flanking rules
+// are the exception — they are specified over Unicode classes — so those decode
+// codepoints (see `classifyBefore`/`classifyAfter`).
+//
+// `byteAt` returns 0 past the end of the string. NUL is replaced with U+FFFD
+// before parsing starts (the spec requires it), so 0 unambiguously means "end".
+
+fn byteAt(s: &string, i: i64): u8 {
+    if i < 0 || i >= s.len {
+        return 0
+    }
+    return s[i]
+}
+
+fn isSpaceOrTab(c: u8): bool {
+    return c == ' ' || c == '\t'
+}
+
+fn isLineEnd(c: u8): bool {
+    return c == 0 || c == '\n'
+}
+
+fn isDigitByte(c: u8): bool {
+    return c >= '0' && c <= '9'
+}
+
+fn isAlphaByte(c: u8): bool {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+fn isAlnumByte(c: u8): bool {
+    return isAlphaByte(c) || isDigitByte(c)
+}
+
+fn isHexByte(c: u8): bool {
+    return isDigitByte(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+fn lowerByte(c: u8): u8 {
+    if c >= 'A' && c <= 'Z' {
+        return c + 32
+    }
+    return c
+}
+
+// The 32 ASCII punctuation characters, which are exactly the ones a backslash
+// may escape.
+fn isAsciiPunct(c: u8): bool {
+    if c >= '!' && c <= '/' {
+        return true
+    }
+    if c >= ':' && c <= '@' {
+        return true
+    }
+    if c >= '[' && c <= '`' {
+        return true
+    }
+    if c >= '{' && c <= '~' {
+        return true
+    }
+    return false
+}
+
+// A blank line is one with nothing but spaces and tabs.
+fn isBlankStr(s: &string): bool {
+    for c in s {
+        if c != ' ' && c != '\t' && c != '\n' && c != '\r' {
+            return false
+        }
+    }
+    return true
+}
+
+fn toLowerStr(s: &string): string {
+    var out = ""
+    for c in s {
+        out.push(lowerByte(c))
+    }
+    return out
+}
+
+// ── Unicode classes for the emphasis flanking rules ─────────────────────────
+//
+// The spec defines left/right-flanking over *Unicode* whitespace and
+// punctuation, so a byte test is not enough: `*"héllo"*` and the CJK examples
+// hinge on the class of a non-ASCII codepoint. This covers the classes the
+// spec's own examples exercise plus the common ranges; it is not a full Unicode
+// character database, and a codepoint outside these ranges classifies as
+// "other", which is the same answer a letter would get.
+
+fn isUnicodeWhitespaceCp(cp: i32): bool {
+    if cp == 32 || cp == 9 || cp == 10 || cp == 12 || cp == 13 {
+        return true
+    }
+    if cp == 160 {
+        return true
+    } // NBSP
+    if cp == 5760 {
+        return true
+    } // OGHAM SPACE MARK
+    if cp >= 8192 && cp <= 8202 {
+        return true
+    } // EN QUAD .. HAIR SPACE
+    if cp == 8232 || cp == 8233 {
+        return true
+    } // LINE/PARAGRAPH SEPARATOR
+    if cp == 8239 || cp == 8287 || cp == 12288 {
+        return true
+    }
+    return false
+}
+
+// The Unicode currency symbols (category Sc). The spec counts every Symbol
+// category as punctuation for flanking, and currency signs are the ones that
+// turn up in front of emphasis in real text.
+fn isCurrencySymbolCp(cp: i32): bool {
+    if cp == 36 || cp == 1423 || cp == 1547 || cp == 2555 || cp == 2801 {
+        return true
+    }
+    if cp >= 162 && cp <= 165 {
+        return true
+    }
+    if cp >= 2046 && cp <= 2047 {
+        return true
+    }
+    if cp >= 2546 && cp <= 2547 {
+        return true
+    }
+    if cp == 3065 || cp == 3647 || cp == 6107 || cp == 43064 {
+        return true
+    }
+    if cp >= 8352 && cp <= 8399 {
+        return true
+    }
+    if cp == 65020 || cp == 65129 || cp == 65284 {
+        return true
+    }
+    if cp >= 65504 && cp <= 65505 {
+        return true
+    }
+    if cp >= 65509 && cp <= 65510 {
+        return true
+    }
+    if cp >= 73693 && cp <= 73696 {
+        return true
+    }
+    if cp == 123647 || cp == 126128 {
+        return true
+    }
+    return false
+}
+
+fn isUnicodePunctCp(cp: i32): bool {
+    if cp < 128 {
+        return isAsciiPunct(cp as u8)
+    }
+    if isCurrencySymbolCp(cp) {
+        return true
+    }
+    if cp >= 161 && cp <= 191 {
+        // Latin-1 punctuation and symbols (inverted marks, guillemets, etc.).
+        // The spec counts the Symbol categories here too since 0.30.
+        return true
+    }
+    if cp == 215 || cp == 247 {
+        return true
+    }
+    if cp >= 8192 && cp <= 8303 {
+        return true
+    } // General Punctuation
+    if cp >= 8352 && cp <= 8399 {
+        return true
+    } // Currency Symbols
+    if cp >= 8592 && cp <= 9215 {
+        return true
+    } // Arrows .. Misc Technical
+    if cp >= 9312 && cp <= 11263 {
+        return true
+    } // Enclosed .. Misc Symbols
+    if cp >= 11776 && cp <= 11903 {
+        return true
+    } // Supplemental Punctuation
+    if cp >= 12289 && cp <= 12351 {
+        return true
+    } // CJK Symbols and Punctuation
+    if cp >= 65072 && cp <= 65103 {
+        return true
+    } // CJK Compatibility Forms
+    if cp >= 65281 && cp <= 65295 {
+        return true
+    } // Fullwidth ASCII punctuation
+    if cp >= 65306 && cp <= 65312 {
+        return true
+    }
+    if cp >= 65339 && cp <= 65344 {
+        return true
+    }
+    if cp >= 65371 && cp <= 65381 {
+        return true
+    }
+    return false
+}
+
+// ── HTML output escaping ─────────────────────────────────────────────────────
+//
+// Escaping is the security boundary of this package: everything below renders
+// attacker-controlled text into a document. `escapeHtml` covers element text and
+// quoted attribute values (`&`, `<`, `>`, `"` — matching cmark, which leaves `'`
+// alone because it never emits a single-quoted attribute). `escapeHref`
+// percent-encodes everything a URL may not carry literally, which is what stops
+// a destination from closing the attribute and opening a tag.
+//
+// Neither function makes raw HTML safe. A `HtmlBlock`/`HtmlInline` node's
+// literal is emitted verbatim, exactly as CommonMark specifies — if you render
+// untrusted markdown, filter those nodes (they are visible in the tree) or run
+// the output through a sanitizer.
+
+pub fn escapeHtml(s: &string): string {
+    var out = ""
+    escapeHtmlInto(s, out)
+    return out
+}
+
+fn escapeHtmlInto(s: &string, out: &mut string): void {
+    for c in s {
+        if c == '&' {
+            out.pushStr("&amp;")
+        } else if c == '<' {
+            out.pushStr("&lt;")
+        } else if c == '>' {
+            out.pushStr("&gt;")
+        } else if c == '"' {
+            out.pushStr("&quot;")
+        } else {
+            out.push(c)
+        }
+    }
+}
+
+fn hexDigitUpper(v: i64): u8 {
+    if v < 10 {
+        return ('0' as i64 + v) as u8
+    }
+    return ('A' as i64 + (v - 10)) as u8
+}
+
+// Percent-encode a URL for an href/src attribute. The safe set is cmark's:
+// alphanumerics plus `!#$%()*+,-./:;=?@_~`. `%` passes through so an
+// already-encoded `%20` is not double-encoded (cmark does the same, and copies
+// even a malformed `%zz` through). `&` and `'` come out as character references
+// because the result lands inside a double-quoted attribute.
+fn escapeHref(s: &string, out: &mut string): void {
+    for c in s {
+        if isAlnumByte(c) {
+            out.push(c)
+            continue
+        }
+        if c == '!' || c == '#' || c == '$' || c == '%' || c == '(' || c == ')'
+        || c == '*' || c == '+' || c == ',' || c == '-' || c == '.' || c == '/'
+        || c == ':' || c == ';' || c == '=' || c == '?' || c == '@' || c == '_'
+        || c == '~' {
+            out.push(c)
+            continue
+        }
+        if c == '&' {
+            out.pushStr("&amp;")
+            continue
+        }
+        if c == '\'' {
+            out.pushStr("&#x27;")
+            continue
+        }
+        out.push('%')
+        out.push(hexDigitUpper((c as i64) / 16))
+        out.push(hexDigitUpper((c as i64) % 16))
+    }
+}
+
+// ── Raw-HTML scanners (shared by html blocks and inline html) ────────────────
+
+// The HTML block tag list from the spec's condition 6, and condition 1's four
+// literal-text elements. A `|name|` membership test beats a Vec of strings here:
+// it allocates nothing per call and the list is fixed by the spec.
+fn isHtmlBlockTag(name: &string): bool {
+    let tags = "|address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h1|h2|h3|h4|h5|h6|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul|"
+    let probe = "|" + toLowerStr(name) + "|"
+    return tags.contains(probe)
+}
+
+fn isRawTextTag(name: &string): bool {
+    let lower = toLowerStr(name)
+    return lower == "script" || lower == "pre" || lower == "style" || lower == "textarea"
+}
+
+// Length of an HTML tag name starting at `at`, or 0.
+fn scanTagName(s: &string, at: i64): i64 {
+    if !isAlphaByte(byteAt(s, at)) {
+        return 0
+    }
+    var i = at + 1
+    while i < s.len {
+        let c = s[i]
+        if isAlnumByte(c) || c == '-' {
+            i = i + 1
+        } else {
+            break
+        }
+    }
+    return i - at
+}
+
+fn isHtmlSpace(c: u8): bool {
+    return c == ' ' || c == '\t' || c == '\n'
+}
+
+fn skipHtmlSpace(s: &string, at: i64): i64 {
+    var i = at
+    while i < s.len && isHtmlSpace(s[i]) {
+        i = i + 1
+    }
+    return i
+}
+
+// Index just past `<name attr…>` at `start`, or -1.
+fn scanOpenTag(s: &string, start: i64): i64 {
+    if byteAt(s, start) != '<' {
+        return -1
+    }
+    let nameLen = scanTagName(s, start + 1)
+    if nameLen == 0 {
+        return -1
+    }
+    var i = start + 1 + nameLen
+    // attributes
+    while true {
+        let afterSpace = skipHtmlSpace(s, i)
+        if afterSpace == i {
+            break
+        }
+        let c = byteAt(s, afterSpace)
+        if !(isAlphaByte(c) || c == '_' || c == ':') {
+            i = afterSpace
+            break
+        }
+        var j = afterSpace + 1
+        while j < s.len {
+            let a = s[j]
+            if isAlnumByte(a) || a == '_' || a == '.' || a == ':' || a == '-' {
+                j = j + 1
+            } else {
+                break
+            }
+        }
+        // optional value
+        let beforeEq = skipHtmlSpace(s, j)
+        if byteAt(s, beforeEq) == '=' {
+            var v = skipHtmlSpace(s, beforeEq + 1)
+            let q = byteAt(s, v)
+            if q == '"' || q == '\'' {
+                v = v + 1
+                while v < s.len && s[v] != q {
+                    v = v + 1
+                }
+                if v >= s.len {
+                    return -1
+                }
+                j = v + 1
+            } else {
+                let vstart = v
+                while v < s.len {
+                    let a = s[v]
+                    if isHtmlSpace(a) || a == '"' || a == '\'' || a == '=' || a == '<' || a == '>' || a == '`' {
+                        break
+                    }
+                    v = v + 1
+                }
+                if v == vstart {
+                    return -1
+                }
+                j = v
+            }
+        }
+        i = j
+    }
+    i = skipHtmlSpace(s, i)
+    if byteAt(s, i) == '/' {
+        i = i + 1
+    }
+    if byteAt(s, i) != '>' {
+        return -1
+    }
+    return i + 1
+}
+
+// Index just past `</name>` at `start`, or -1.
+fn scanCloseTag(s: &string, start: i64): i64 {
+    if byteAt(s, start) != '<' || byteAt(s, start + 1) != '/' {
+        return -1
+    }
+    let nameLen = scanTagName(s, start + 2)
+    if nameLen == 0 {
+        return -1
+    }
+    let i = skipHtmlSpace(s, start + 2 + nameLen)
+    if byteAt(s, i) != '>' {
+        return -1
+    }
+    return i + 1
+}
+
+// Index just past any inline raw-HTML construct at `start`, or -1: open tag,
+// closing tag, comment, processing instruction, declaration, or CDATA.
+fn scanHtmlInline(s: &string, start: i64): i64 {
+    if byteAt(s, start) != '<' {
+        return -1
+    }
+    let c = byteAt(s, start + 1)
+    if c == '!' {
+        let c2 = byteAt(s, start + 2)
+        if c2 == '-' && byteAt(s, start + 3) == '-' {
+            // Since 0.31 a comment is `<!-->`, `<!--->`, or `<!--` up to the
+            // first `-->`; the old "no double hyphen inside" rule is gone.
+            var i = start + 4
+            if byteAt(s, i) == '>' {
+                return i + 1
+            }
+            if byteAt(s, i) == '-' && byteAt(s, i + 1) == '>' {
+                return i + 2
+            }
+            while i < s.len {
+                if s[i] == '-' && byteAt(s, i + 1) == '-' && byteAt(s, i + 2) == '>' {
+                    return i + 3
+                }
+                i = i + 1
+            }
+            return -1
+        }
+        if c2 == '[' && s[start + 2..s.len].startsWith("[CDATA[") {
+            var i = start + 9
+            while i < s.len {
+                if s[i] == ']' && byteAt(s, i + 1) == ']' && byteAt(s, i + 2) == '>' {
+                    return i + 3
+                }
+                i = i + 1
+            }
+            return -1
+        }
+        if isAlphaByte(c2) {
+            var i = start + 2
+            while i < s.len && s[i] != '>' {
+                i = i + 1
+            }
+            if i >= s.len {
+                return -1
+            }
+            return i + 1
+        }
+        return -1
+    }
+    if c == '?' {
+        var i = start + 2
+        while i < s.len {
+            if s[i] == '?' && byteAt(s, i + 1) == '>' {
+                return i + 2
+            }
+            i = i + 1
+        }
+        return -1
+    }
+    if c == '/' {
+        return scanCloseTag(s, start)
+    }
+    return scanOpenTag(s, start)
+}
+
+// ── Block-start scanners ─────────────────────────────────────────────────────
+
+// `***`, `---`, `___`: three or more of one character, spaces and tabs allowed
+// between. Returns true if the rest of the line from `at` is a thematic break.
+fn isThematicBreak(s: &string, at: i64): bool {
+    let c = byteAt(s, at)
+    if c != '*' && c != '-' && c != '_' {
+        return false
+    }
+    var count: i64 = 0
+    var i = at
+    while i < s.len {
+        let b = s[i]
+        if b == c {
+            count = count + 1
+        } else if !isSpaceOrTab(b) {
+            return false
+        }
+        i = i + 1
+    }
+    return count >= 3
+}
+
+// Number of `#`s of an ATX heading marker at `at`, or 0. The marker must be
+// followed by a space, a tab, or the end of the line.
+fn scanAtxMarker(s: &string, at: i64): i64 {
+    var n: i64 = 0
+    var i = at
+    while i < s.len && s[i] == '#' && n < 7 {
+        n = n + 1
+        i = i + 1
+    }
+    if n == 0 || n > 6 {
+        return 0
+    }
+    let c = byteAt(s, i)
+    if c != 0 && !isSpaceOrTab(c) {
+        return 0
+    }
+    return n
+}
+
+// Length of a code fence (3+ backticks or tildes) at `at`, or 0.
+fn scanCodeFence(s: &string, at: i64): i64 {
+    let c = byteAt(s, at)
+    if c != '`' && c != '~' {
+        return 0
+    }
+    var n: i64 = 0
+    var i = at
+    while i < s.len && s[i] == c {
+        n = n + 1
+        i = i + 1
+    }
+    if n < 3 {
+        return 0
+    }
+    // An info string on a backtick fence may not itself contain a backtick,
+    // otherwise `` `foo` `` inline code would be readable as a fence.
+    if c == '`' {
+        var j = i
+        while j < s.len {
+            if s[j] == '`' {
+                return 0
+            }
+            j = j + 1
+        }
+    }
+    return n
+}
+
+// Whether the line from `at` closes a fence of `fenceChar` x `fenceLen`.
+fn isClosingFence(s: &string, at: i64, fenceChar: u8, fenceLen: i64): bool {
+    var n: i64 = 0
+    var i = at
+    while i < s.len && s[i] == fenceChar {
+        n = n + 1
+        i = i + 1
+    }
+    if n < fenceLen {
+        return false
+    }
+    while i < s.len {
+        if !isSpaceOrTab(s[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 1 for `===`, 2 for `---`, 0 for anything else — a setext heading underline.
+fn scanSetextLine(s: &string, at: i64): i64 {
+    let c = byteAt(s, at)
+    if c != '=' && c != '-' {
+        return 0
+    }
+    var i = at
+    while i < s.len && s[i] == c {
+        i = i + 1
+    }
+    while i < s.len {
+        if !isSpaceOrTab(s[i]) {
+            return 0
+        }
+        i = i + 1
+    }
+    if c == '=' {
+        return 1
+    }
+    return 2
+}
+
+// ── Parser state ─────────────────────────────────────────────────────────────
+
+fn isKind(a: NodeKind, b: NodeKind): bool {
+    return (a as i32) == (b as i32)
+}
+
+// Which containers may hold which children. A list holds only items; an item,
+// a block quote and the document hold anything but a bare item; leaves hold
+// nothing.
+fn canContain(parent: NodeKind, child: NodeKind): bool {
+    if isKind(parent, NodeKind.List) {
+        return isKind(child, NodeKind.Item)
+    }
+    if isKind(parent, NodeKind.Document) || isKind(parent, NodeKind.BlockQuote) || isKind(parent, NodeKind.Item) {
+        return !isKind(child, NodeKind.Item)
+    }
+    return false
+}
+
+// Leaves that swallow the rest of the line as text rather than letting new
+// blocks start inside them.
+fn acceptsLines(k: NodeKind): bool {
+    return isKind(k, NodeKind.Paragraph) || isKind(k, NodeKind.CodeBlock)
+    || isKind(k, NodeKind.HtmlBlock) || isKind(k, NodeKind.Table)
+}
+
+struct Delim {
+    cc: u8,
+    numdelims: i64,
+    origdelims: i64,
+    node: i64,
+    prev: i64,
+    next: i64,
+    canOpen: bool,
+    canClose: bool,
+}
+
+struct Bracket {
+    node: i64,
+    prev: i64,
+    prevDelim: i64,
+    index: i64,
+    image: bool,
+    active: bool,
+    bracketAfter: bool,
+}
+
+struct MdParser {
+    nodes: Vec<MdNode>,
+    doc: i64,
+    tip: i64,
+    oldtip: i64,
+    lastMatched: i64,
+
+    line: string,
+    pos: i64, // byte offset into `line`
+    col: i64, // column, with tabs expanded to 4-column stops
+    nextNonspace: i64,
+    nextNonspaceCol: i64,
+    indent: i64,
+    indented: bool,
+    blank: bool,
+    partialTab: bool,
+    allClosed: bool,
+    lineNumber: i64,
+
+    // Link reference definitions: normalized label -> index into refDest/refTitle.
+    refKeys: HashMap<string, i64>,
+    refDest: Vec<string>,
+    refTitle: Vec<string>,
+
+    // Inline phase.
+    subject: string,
+    ipos: i64,
+    delims: Vec<Delim>,
+    delimTop: i64,
+    brackets: Vec<Bracket>,
+    bracketTop: i64,
+}
+
+impl MdParser {
+    fn new(): MdParser {
+        var nodes: Vec<MdNode> = Vec.new()
+        nodes.push(mdNode(NodeKind.Document))
+        return MdParser {
+            nodes: nodes,
+            doc: 0,
+            tip: 0,
+            oldtip: 0,
+            lastMatched: 0,
+            line: "",
+            pos: 0,
+            col: 0,
+            nextNonspace: 0,
+            nextNonspaceCol: 0,
+            indent: 0,
+            indented: false,
+            blank: false,
+            partialTab: false,
+            allClosed: true,
+            lineNumber: 0,
+            refKeys: HashMap.new(),
+            refDest: Vec.new(),
+            refTitle: Vec.new(),
+            subject: "",
+            ipos: 0,
+            delims: Vec.new(),
+            delimTop: -1,
+            brackets: Vec.new(),
+            bracketTop: -1,
+        }
+    }
+
+    // ── Pool and tree plumbing ───────────────────────────────────────────────
+
+    fn addNode(self: &mut Self, kind: NodeKind): i64 {
+        let id = self.nodes.len
+        self.nodes.push(mdNode(kind))
+        return id
+    }
+
+    fn appendChild(self: &mut Self, parent: i64, child: i64): void {
+        self.nodes[child].parent = parent
+        self.nodes[child].next = -1
+        let last = self.nodes[parent].lastChild
+        self.nodes[child].prev = last
+        if last >= 0 {
+            self.nodes[last].next = child
+        } else {
+            self.nodes[parent].firstChild = child
+        }
+        self.nodes[parent].lastChild = child
+    }
+
+    fn unlinkNode(self: &mut Self, node: i64): void {
+        let p = self.nodes[node].parent
+        let nx = self.nodes[node].next
+        let pv = self.nodes[node].prev
+        if pv >= 0 {
+            self.nodes[pv].next = nx
+        } else if p >= 0 {
+            self.nodes[p].firstChild = nx
+        }
+        if nx >= 0 {
+            self.nodes[nx].prev = pv
+        } else if p >= 0 {
+            self.nodes[p].lastChild = pv
+        }
+        self.nodes[node].parent = -1
+        self.nodes[node].next = -1
+        self.nodes[node].prev = -1
+    }
+
+    // Splice `sibling` in directly after `node`.
+    fn insertAfter(self: &mut Self, node: i64, sibling: i64): void {
+        let nx = self.nodes[node].next
+        self.nodes[sibling].next = nx
+        if nx >= 0 {
+            self.nodes[nx].prev = sibling
+        }
+        self.nodes[sibling].prev = node
+        self.nodes[node].next = sibling
+        let p = self.nodes[node].parent
+        self.nodes[sibling].parent = p
+        if nx < 0 && p >= 0 {
+            self.nodes[p].lastChild = sibling
+        }
+    }
+
+    fn addChild(self: &mut Self, kind: NodeKind): i64 {
+        while !canContain(self.nodes[self.tip].kind, kind) {
+            self.finalize(self.tip)
+        }
+        let n = self.addNode(kind)
+        let t = self.tip
+        self.appendChild(t, n)
+        self.tip = n
+        return n
+    }
+
+    // ── Line cursor, with the spec's tab-stop rules ──────────────────────────
+    //
+    // A tab advances to the next 4-column stop, so consuming *columns* can land
+    // mid-tab. `partialTab` records that: the offset stays on the tab and
+    // `addLine` re-emits the leftover columns as spaces. Expanding tabs up front
+    // instead would be simpler and wrong — a tab inside a code block has to
+    // survive into the output byte for byte.
+
+    fn advanceOffset(self: &mut Self, amount: i64, columns: bool): void {
+        var count = amount
+        while count > 0 {
+            let c = byteAt(self.line, self.pos)
+            if c == 0 {
+                break
+            }
+            if c == '\t' {
+                let charsToTab = 4 - (self.col % 4)
+                if columns {
+                    self.partialTab = charsToTab > count
+                    var charsToAdvance = charsToTab
+                    if charsToTab > count {
+                        charsToAdvance = count
+                    }
+                    self.col = self.col + charsToAdvance
+                    if !self.partialTab {
+                        self.pos = self.pos + 1
+                    }
+                    count = count - charsToAdvance
+                } else {
+                    self.partialTab = false
+                    self.col = self.col + charsToTab
+                    self.pos = self.pos + 1
+                    count = count - 1
+                }
+            } else {
+                self.partialTab = false
+                self.pos = self.pos + 1
+                self.col = self.col + 1
+                count = count - 1
+            }
+        }
+    }
+
+    fn advanceNextNonspace(self: &mut Self): void {
+        self.pos = self.nextNonspace
+        self.col = self.nextNonspaceCol
+        self.partialTab = false
+    }
+
+    fn findNextNonspace(self: &mut Self): void {
+        var i = self.pos
+        var cols = self.col
+        while i < self.line.len {
+            let c = self.line[i]
+            if c == ' ' {
+                i = i + 1
+                cols = cols + 1
+            } else if c == '\t' {
+                i = i + 1
+                cols = cols + (4 - (cols % 4))
+            } else {
+                break
+            }
+        }
+        self.blank = i >= self.line.len
+        self.nextNonspace = i
+        self.nextNonspaceCol = cols
+        self.indent = self.nextNonspaceCol - self.col
+        self.indented = self.indent >= 4
+    }
+
+    fn addLine(self: &mut Self): void {
+        let t = self.tip
+        if self.partialTab {
+            self.pos = self.pos + 1
+            let charsToTab = 4 - (self.col % 4)
+            let pad = " ".repeat(charsToTab)
+            self.nodes[t].content.pushStr(pad)
+        }
+        let rest = self.line.substr(self.pos, self.line.len)
+        self.nodes[t].content.pushStr(rest)
+        self.nodes[t].content.push('\n')
+    }
+
+    fn closeUnmatchedBlocks(self: &mut Self): void {
+        if self.allClosed {
+            return
+        }
+        while self.oldtip != self.lastMatched {
+            let parent = self.nodes[self.oldtip].parent
+            self.finalize(self.oldtip)
+            self.oldtip = parent
+        }
+        self.allClosed = true
+    }
+
+    // ── The line loop ────────────────────────────────────────────────────────
+    //
+    // For each line: walk the open containers checking whether the line
+    // continues each one, then try to start new blocks, then hand what is left
+    // to the deepest open leaf. This is the CommonMark reference algorithm; the
+    // three phases are what make lazy continuation and list nesting fall out
+    // instead of needing special cases.
+
+    fn incorporateLine(self: &mut Self, ln: string): void {
+        var allMatched = true
+        var container = self.doc
+        self.oldtip = self.tip
+        self.pos = 0
+        self.col = 0
+        self.blank = false
+        self.partialTab = false
+        self.lineNumber = self.lineNumber + 1
+        self.line = ln
+
+        var lastChild = self.nodes[container].lastChild
+        while lastChild >= 0 && self.nodes[lastChild].open {
+            container = lastChild
+            self.findNextNonspace()
+            let r = self.continueBlock(container)
+            if r == 1 {
+                allMatched = false
+            } else if r == 2 {
+                return
+            }
+            if !allMatched {
+                container = self.nodes[container].parent
+                break
+            }
+            lastChild = self.nodes[container].lastChild
+        }
+
+        self.allClosed = container == self.oldtip
+        self.lastMatched = container
+
+        var matchedLeaf = !isKind(self.nodes[container].kind, NodeKind.Paragraph)
+        && acceptsLines(self.nodes[container].kind)
+        while !matchedLeaf {
+            self.findNextNonspace()
+            // Nothing that can begin a block starts with this byte, so skip the
+            // eight start scanners entirely — this is the hot path for ordinary
+            // paragraph text.
+            if !self.indented && !maybeSpecial(byteAt(self.line, self.nextNonspace)) {
+                self.advanceNextNonspace()
+                break
+            }
+            let res = self.tryBlockStarts(container)
+            if res == 0 {
+                self.advanceNextNonspace()
+                break
+            }
+            container = self.tip
+            if res == 2 {
+                matchedLeaf = true
+            }
+        }
+
+        // What is left of the line is text for the deepest open block.
+        if !self.allClosed && !self.blank && isKind(self.nodes[self.tip].kind, NodeKind.Paragraph) {
+            // Lazy continuation: a paragraph inside a container keeps going even
+            // though the container's own marker is missing on this line.
+            self.addLine()
+            return
+        }
+
+        self.closeUnmatchedBlocks()
+        // A blank line ends the block that was open on it, and that block is
+        // what list tightness is measured on — without this the paragraph
+        // before the blank never records it and every list reads as tight.
+        if self.blank && self.nodes[container].lastChild >= 0 {
+            let lc = self.nodes[container].lastChild
+            self.nodes[lc].lastLineBlank = true
+        }
+        let k = self.nodes[container].kind
+
+        // A blank line inside a block quote or a fenced code block does not
+        // count for list tightness, and neither does one on an item's own
+        // marker line.
+        var lastLineBlank = self.blank
+        if isKind(k, NodeKind.BlockQuote) {
+            lastLineBlank = false
+        } else if isKind(k, NodeKind.CodeBlock) && self.nodes[container].isFenced {
+            lastLineBlank = false
+        } else if isKind(k, NodeKind.Item) && self.nodes[container].firstChild < 0 {
+            lastLineBlank = false
+        }
+        var cont = container
+        while cont >= 0 {
+            self.nodes[cont].lastLineBlank = lastLineBlank
+            cont = self.nodes[cont].parent
+        }
+
+        if acceptsLines(k) {
+            self.addLine()
+            if isKind(k, NodeKind.HtmlBlock) {
+                let t = self.nodes[container].htmlBlockType
+                if t >= 1 && t <= 5 && self.htmlBlockCloses(t) {
+                    self.finalize(container)
+                }
+            }
+        } else if self.pos < self.line.len && !self.blank {
+            let p = self.addChild(NodeKind.Paragraph)
+            self.advanceNextNonspace()
+            self.addLine()
+        }
+    }
+
+    // 0 = matched, 1 = did not match, 2 = line consumed entirely.
+    fn continueBlock(self: &mut Self, container: i64): i64 {
+        let k = self.nodes[container].kind
+        if isKind(k, NodeKind.Document) || isKind(k, NodeKind.List) {
+            return 0
+        }
+        if isKind(k, NodeKind.BlockQuote) {
+            if !self.indented && byteAt(self.line, self.nextNonspace) == '>' {
+                self.advanceNextNonspace()
+                self.advanceOffset(1, false)
+                if isSpaceOrTab(byteAt(self.line, self.pos)) {
+                    self.advanceOffset(1, true)
+                }
+                return 0
+            }
+            return 1
+        }
+        if isKind(k, NodeKind.Item) {
+            if self.blank {
+                if self.nodes[container].firstChild < 0 {
+                    return 1
+                }
+                self.advanceNextNonspace()
+                return 0
+            }
+            let need = self.nodes[container].listMarkerOffset + self.nodes[container].listPadding
+            if self.indent >= need {
+                self.advanceOffset(need, true)
+                return 0
+            }
+            return 1
+        }
+        if isKind(k, NodeKind.Heading) || isKind(k, NodeKind.ThematicBreak) {
+            return 1
+        }
+        if isKind(k, NodeKind.CodeBlock) {
+            if self.nodes[container].isFenced {
+                let fc = self.nodes[container].fenceChar
+                let fl = self.nodes[container].fenceLen
+                if !self.indented && isClosingFence(self.line, self.nextNonspace, fc, fl) {
+                    self.finalize(container)
+                    return 2
+                }
+                // A closing fence may be indented up to the opening fence's own
+                // indent, and that much indentation is stripped from content.
+                var n = self.nodes[container].fenceOffset
+                while n > 0 && isSpaceOrTab(byteAt(self.line, self.pos)) {
+                    self.advanceOffset(1, true)
+                    n = n - 1
+                }
+                return 0
+            }
+            if self.indent >= 4 {
+                self.advanceOffset(4, true)
+                return 0
+            }
+            if self.blank {
+                self.advanceNextNonspace()
+                return 0
+            }
+            return 1
+        }
+        if isKind(k, NodeKind.HtmlBlock) {
+            let t = self.nodes[container].htmlBlockType
+            if self.blank && (t == 6 || t == 7) {
+                return 1
+            }
+            return 0
+        }
+        if isKind(k, NodeKind.Paragraph) {
+            if self.blank {
+                return 1
+            }
+            return 0
+        }
+        if isKind(k, NodeKind.Table) {
+            if self.blank {
+                return 1
+            }
+            // GFM ends a table at the first blank line or the start of another
+            // block-level structure. Since a table swallows lines, the check has
+            // to happen here rather than in the block-start scanners.
+            if self.tableLineEnds() {
+                return 1
+            }
+            return 0
+        }
+        return 0
+    }
+
+    // 0 = no start, 1 = new container, 2 = new leaf (stop trying starts).
+    fn tryBlockStarts(self: &mut Self, container: i64): i64 {
+        // block quote
+        if !self.indented && byteAt(self.line, self.nextNonspace) == '>' {
+            self.advanceNextNonspace()
+            self.advanceOffset(1, false)
+            if isSpaceOrTab(byteAt(self.line, self.pos)) {
+                self.advanceOffset(1, true)
+            }
+            self.closeUnmatchedBlocks()
+            self.addChild(NodeKind.BlockQuote)
+            return 1
+        }
+
+        // ATX heading
+        let hashes = scanAtxMarker(self.line, self.nextNonspace)
+        if !self.indented && hashes > 0 {
+            self.advanceNextNonspace()
+            self.advanceOffset(hashes, false)
+            while isSpaceOrTab(byteAt(self.line, self.pos)) {
+                self.advanceOffset(1, false)
+            }
+            self.closeUnmatchedBlocks()
+            let h = self.addChild(NodeKind.Heading)
+            self.nodes[h].level = hashes
+            let raw = self.line.substr(self.pos, self.line.len)
+            let stripped = stripAtxTrailing(raw)
+            self.nodes[h].content = stripped
+            let remaining = self.line.len - self.pos
+            self.advanceOffset(remaining, false)
+            return 2
+        }
+
+        // fenced code block
+        let fenceLen = scanCodeFence(self.line, self.nextNonspace)
+        if !self.indented && fenceLen > 0 {
+            let fc = byteAt(self.line, self.nextNonspace)
+            let fo = self.indent
+            self.closeUnmatchedBlocks()
+            let c = self.addChild(NodeKind.CodeBlock)
+            self.nodes[c].isFenced = true
+            self.nodes[c].fenceLen = fenceLen
+            self.nodes[c].fenceChar = fc
+            self.nodes[c].fenceOffset = fo
+            self.advanceNextNonspace()
+            self.advanceOffset(fenceLen, false)
+            return 2
+        }
+
+        // html block
+        if !self.indented && byteAt(self.line, self.nextNonspace) == '<' {
+            let bt = self.htmlBlockStartType(container)
+            if bt > 0 {
+                self.closeUnmatchedBlocks()
+                let b = self.addChild(NodeKind.HtmlBlock)
+                self.nodes[b].htmlBlockType = bt
+                return 2
+            }
+        }
+
+        // GFM table: a one-line paragraph followed by a delimiter row.
+        if !self.indented && isKind(self.nodes[container].kind, NodeKind.Paragraph) {
+            if self.tryTableStart(container) {
+                return 2
+            }
+        }
+
+        // setext heading underline
+        if !self.indented && isKind(self.nodes[container].kind, NodeKind.Paragraph) {
+            let lvl = scanSetextLine(self.line, self.nextNonspace)
+            if lvl > 0 {
+                self.closeUnmatchedBlocks()
+                self.consumeRefDefs(container)
+                if self.nodes[container].content.len > 0 {
+                    let h = self.addNode(NodeKind.Heading)
+                    self.nodes[h].level = lvl
+                    let text = self.nodes[container].content.clone()
+                    self.nodes[h].content = text
+                    self.insertAfter(container, h)
+                    self.unlinkNode(container)
+                    self.tip = h
+                    let remaining = self.line.len - self.pos
+                    self.advanceOffset(remaining, false)
+                    return 2
+                }
+                return 0
+            }
+        }
+
+        // thematic break
+        if !self.indented && isThematicBreak(self.line, self.nextNonspace) {
+            self.closeUnmatchedBlocks()
+            self.addChild(NodeKind.ThematicBreak)
+            let remaining = self.line.len - self.pos
+            self.advanceOffset(remaining, false)
+            return 2
+        }
+
+        // list item
+        if !self.indented || isKind(self.nodes[container].kind, NodeKind.List) {
+            let data = self.parseListMarker(container)
+            if data.ok {
+                self.closeUnmatchedBlocks()
+                if !isKind(self.nodes[self.tip].kind, NodeKind.List) || !self.listMatches(container, data) {
+                    let l = self.addChild(NodeKind.List)
+                    self.nodes[l].listOrdered = data.ordered
+                    self.nodes[l].listDelim = data.delim
+                    self.nodes[l].level = data.start
+                    self.nodes[l].listTight = true
+                }
+                let it = self.addChild(NodeKind.Item)
+                self.nodes[it].listOrdered = data.ordered
+                self.nodes[it].listDelim = data.delim
+                self.nodes[it].listPadding = data.padding
+                self.nodes[it].listMarkerOffset = data.markerOffset
+                return 1
+            }
+        }
+
+        // indented code block
+        if self.indented && !isKind(self.nodes[self.tip].kind, NodeKind.Paragraph) && !self.blank {
+            self.advanceOffset(4, true)
+            self.closeUnmatchedBlocks()
+            self.addChild(NodeKind.CodeBlock)
+            return 2
+        }
+
+        return 0
+    }
+
+    // Does the list `container` (or the innermost open list) accept an item with
+    // this marker? A different bullet or delimiter starts a new list.
+    fn listMatches(self: &Self, container: i64, data: ListData): bool {
+        if !isKind(self.nodes[container].kind, NodeKind.List) {
+            return false
+        }
+        return self.nodes[container].listOrdered == data.ordered
+        && self.nodes[container].listDelim == data.delim
+    }
+
+    fn parseListMarker(self: &mut Self, container: i64): ListData {
+        var data = ListData {
+            ordered: false, bulletChar: 0, start: 1, delim: 0,
+            padding: 0, markerOffset: self.indent, ok: false,
+        }
+        if self.indent >= 4 {
+            return data
+        }
+        let at = self.nextNonspace
+        let c = byteAt(self.line, at)
+        var markerLen: i64 = 0
+        if c == '-' || c == '+' || c == '*' {
+            data.ordered = false
+            data.delim = c
+            markerLen = 1
+        } else if isDigitByte(c) {
+            var i = at
+            var digits: i64 = 0
+            var value: i64 = 0
+            while i < self.line.len && isDigitByte(self.line[i]) && digits < 10 {
+                value = value * 10 + ((self.line[i] - '0') as i64)
+                digits = digits + 1
+                i = i + 1
+            }
+            if digits > 9 {
+                return data
+            }
+            let d = byteAt(self.line, i)
+            if d != '.' && d != ')' {
+                return data
+            }
+            // An ordered list may only interrupt a paragraph if it starts at 1.
+            if isKind(self.nodes[container].kind, NodeKind.Paragraph) && value != 1 {
+                return data
+            }
+            data.ordered = true
+            data.start = value
+            data.delim = d
+            markerLen = digits + 1
+        } else {
+            return data
+        }
+
+        let after = byteAt(self.line, at + markerLen)
+        if after != 0 && !isSpaceOrTab(after) {
+            return data
+        }
+        // A list may not interrupt a paragraph with an empty first item.
+        if isKind(self.nodes[container].kind, NodeKind.Paragraph) {
+            var j = at + markerLen
+            var sawContent = false
+            while j < self.line.len {
+                if !isSpaceOrTab(self.line[j]) {
+                    sawContent = true
+                    break
+                }
+                j = j + 1
+            }
+            if !sawContent {
+                return data
+            }
+        }
+
+        self.advanceNextNonspace()
+        self.advanceOffset(markerLen, true)
+        let spacesStartCol = self.col
+        let spacesStartPos = self.pos
+        var scanning = true
+        while scanning {
+            self.advanceOffset(1, true)
+            let n = byteAt(self.line, self.pos)
+            scanning = self.col - spacesStartCol < 5 && isSpaceOrTab(n)
+        }
+        let blankItem = byteAt(self.line, self.pos) == 0
+        let spacesAfter = self.col - spacesStartCol
+        if spacesAfter >= 5 || spacesAfter < 1 || blankItem {
+            // Content starts more than one space away (or nowhere): the item's
+            // content column is the marker plus a single space, and the extra
+            // spaces belong to whatever the content turns out to be.
+            data.padding = markerLen + 1
+            self.col = spacesStartCol
+            self.pos = spacesStartPos
+            if isSpaceOrTab(byteAt(self.line, self.pos)) {
+                self.advanceOffset(1, true)
+            }
+        } else {
+            data.padding = markerLen + spacesAfter
+        }
+        data.ok = true
+        return data
+    }
+
+    // ── HTML block conditions ────────────────────────────────────────────────
+
+    // Which of the spec's seven html-block start conditions the current line
+    // meets, or 0. Condition 7 (any complete tag alone on its line) is the one
+    // that may not interrupt a paragraph.
+    fn htmlBlockStartType(self: &Self, container: i64): i64 {
+        let at = self.nextNonspace
+        let c1 = byteAt(self.line, at + 1)
+        // 2: comment, 3: processing instruction, 4: declaration, 5: CDATA
+        if c1 == '!' {
+            let c2 = byteAt(self.line, at + 2)
+            if c2 == '-' && byteAt(self.line, at + 3) == '-' {
+                return 2
+            }
+            if c2 == '[' && self.line[at + 2..self.line.len].startsWith("[CDATA[") {
+                return 5
+            }
+            if isAlphaByte(c2) {
+                return 4
+            }
+            return 0
+        }
+        if c1 == '?' {
+            return 3
+        }
+        var nameAt = at + 1
+        var closing = false
+        if c1 == '/' {
+            nameAt = at + 2
+            closing = true
+        }
+        let nameLen = scanTagName(self.line, nameAt)
+        if nameLen > 0 {
+            let name = self.line.substr(nameAt, nameAt + nameLen)
+            let after = byteAt(self.line, nameAt + nameLen)
+            // 1: <script>, <pre>, <style>, <textarea> — raw text to the matching
+            // close tag, blank lines included.
+            if !closing && isRawTextTag(name) && (after == 0 || isHtmlSpace(after) || after == '>') {
+                return 1
+            }
+            // 6: a known block-level tag.
+            if isHtmlBlockTag(name) && (after == 0 || isHtmlSpace(after) || after == '>' || (after == '/' && byteAt(self.line, nameAt + nameLen + 1) == '>')) {
+                return 6
+            }
+        }
+        // 7: a complete open or closing tag, with nothing else on the line.
+        let isPara = isKind(self.nodes[container].kind, NodeKind.Paragraph)
+        let lazyPara = !self.allClosed && !self.blank && isKind(self.nodes[self.tip].kind, NodeKind.Paragraph)
+        if isPara || lazyPara {
+            return 0
+        }
+        var end = scanOpenTag(self.line, at)
+        if end < 0 {
+            end = scanCloseTag(self.line, at)
+        }
+        if end < 0 {
+            return 0
+        }
+        var i = end
+        while i < self.line.len {
+            if !isSpaceOrTab(self.line[i]) {
+                return 0
+            }
+            i = i + 1
+        }
+        return 7
+    }
+
+    fn htmlBlockCloses(self: &Self, blockType: i64): bool {
+        let rest = self.line.substr(self.pos, self.line.len)
+        if blockType == 1 {
+            let lower = toLowerStr(rest)
+            return lower.contains("</script>") || lower.contains("</pre>")
+            || lower.contains("</style>") || lower.contains("</textarea>")
+        }
+        if blockType == 2 {
+            return rest.contains("-->")
+        }
+        if blockType == 3 {
+            return rest.contains("?>")
+        }
+        if blockType == 4 {
+            return rest.contains(">")
+        }
+        if blockType == 5 {
+            return rest.contains("]]>")
+        }
+        return false
+    }
+
+    // ── Finalizing ───────────────────────────────────────────────────────────
+
+    fn finalize(self: &mut Self, block: i64): void {
+        let above = self.nodes[block].parent
+        self.nodes[block].open = false
+        let k = self.nodes[block].kind
+
+        if isKind(k, NodeKind.CodeBlock) {
+            if self.nodes[block].isFenced {
+                let content = self.nodes[block].content.clone()
+                var firstLine = content.clone()
+                var rest = ""
+                match content.indexOf("\n") {
+                    Option.Some(nl) => {
+                        firstLine = content.substr(0, nl)
+                        rest = content.substr(nl + 1, content.len)
+                    }
+                    Option.None => {
+                    }
+                }
+                let info = unescapeString(firstLine.trim())
+                self.nodes[block].dest = info
+                self.nodes[block].literal = rest
+            } else {
+                let content = self.nodes[block].content.clone()
+                let body = stripTrailingBlankLines(content, true)
+                self.nodes[block].literal = body
+            }
+            self.nodes[block].content = ""
+        } else if isKind(k, NodeKind.HtmlBlock) {
+            // A raw block's lines are its content verbatim, trailing blank
+            // line included: `cr` before and after it is what keeps the tags on
+            // their own lines, so stripping here would eat a real newline.
+            let content = self.nodes[block].content.clone()
+            self.nodes[block].literal = content
+            self.nodes[block].content = ""
+        } else if isKind(k, NodeKind.List) {
+            self.finalizeList(block)
+        } else if isKind(k, NodeKind.Table) {
+            self.finalizeTable(block)
+        }
+
+        self.tip = above
+    }
+
+    // A list is loose if any item, or any of an item's children, ends with a
+    // blank line that is not at the very end of the list.
+    // Whether a block's last line was blank, looking through a trailing list or
+    // item: a blank line inside a nested list is recorded on the paragraph that
+    // it closed, not on the list, and the outer list's looseness depends on it.
+    fn endsWithBlankLine(self: &Self, node: i64): bool {
+        var b = node
+        while b >= 0 {
+            if self.nodes[b].lastLineBlank {
+                return true
+            }
+            let k = self.nodes[b].kind
+            if isKind(k, NodeKind.List) || isKind(k, NodeKind.Item) {
+                b = self.nodes[b].lastChild
+            } else {
+                return false
+            }
+        }
+        return false
+    }
+
+    fn finalizeList(self: &mut Self, block: i64): void {
+        var item = self.nodes[block].firstChild
+        while item >= 0 {
+            if self.endsWithBlankLine(item) && self.nodes[item].next >= 0 {
+                self.nodes[block].listTight = false
+                return
+            }
+            var sub = self.nodes[item].firstChild
+            var broke = false
+            while sub >= 0 && !broke {
+                if self.endsWithBlankLine(sub) && (self.nodes[item].next >= 0 || self.nodes[sub].next >= 0) {
+                    self.nodes[block].listTight = false
+                    broke = true
+                } else {
+                    sub = self.nodes[sub].next
+                }
+            }
+            if broke {
+                return
+            }
+            item = self.nodes[item].next
+        }
+    }
+
+    // Strip link reference definitions off the front of a block's content,
+    // recording them. Returns whether any were found.
+    fn consumeRefDefs(self: &mut Self, block: i64): bool {
+        var found = false
+        var content = self.nodes[block].content.clone()
+        while byteAt(content, 0) == '[' {
+            let used = self.parseReference(content)
+            if used <= 0 {
+                break
+            }
+            content = content.substr(used, content.len)
+            found = true
+        }
+        if found {
+            self.nodes[block].content = content
+        }
+        return found
+    }
+
+    // Link reference definitions come off the front of every paragraph in a
+    // separate pass, after the whole block tree exists. Doing it in the
+    // paragraph's finalizer instead would run it while the list containing the
+    // paragraph is still deciding whether it is tight, and a definition that
+    // empties its paragraph would make the blank line before it disappear.
+    fn collectRefDefs(self: &mut Self, node: i64): void {
+        var c = self.nodes[node].firstChild
+        while c >= 0 {
+            let nx = self.nodes[c].next
+            if isKind(self.nodes[c].kind, NodeKind.Paragraph) {
+                let hadRefs = self.consumeRefDefs(c)
+                if hadRefs && isBlankStr(self.nodes[c].content) {
+                    self.unlinkNode(c)
+                }
+            } else {
+                self.collectRefDefs(c)
+            }
+            c = nx
+        }
+    }
+
+    fn processInlines(self: &mut Self, node: i64): void {
+        let k = self.nodes[node].kind
+        if isKind(k, NodeKind.Paragraph) || isKind(k, NodeKind.Heading) || isKind(k, NodeKind.TableCell) {
+            self.parseInlines(node)
+        }
+        var c = self.nodes[node].firstChild
+        while c >= 0 {
+            let nx = self.nodes[c].next
+            self.processInlines(c)
+            c = nx
+        }
+    }
+
+    fn parseAll(self: &mut Self, src: string): void {
+        let lines = mdSplitLines(src)
+        for i in 0..lines.len {
+            let ln = lines[i].clone()
+            self.incorporateLine(ln)
+        }
+        while self.tip >= 0 {
+            self.finalize(self.tip)
+        }
+        let root = self.doc
+        self.markTaskItems(root)
+        self.collectRefDefs(root)
+        self.processInlines(root)
+    }
+}
+
+// Marker data for one list item, filled in by parseListMarker.
+struct ListData {
+    ordered: bool,
+    bulletChar: u8,
+    start: i64,
+    delim: u8,
+    padding: i64,
+    markerOffset: i64,
+    ok: bool,
+}
+
+// Bytes that can begin a block-level construct. Anything else on a line means
+// the eight start scanners cannot match, so they are skipped wholesale.
+fn maybeSpecial(c: u8): bool {
+    return c == '#' || c == '`' || c == '~' || c == '*' || c == '+' || c == '_'
+    || c == '=' || c == '<' || c == '>' || c == '-' || c == '|' || isDigitByte(c)
+}
+
+// Split into lines on \n, \r\n or \r, dropping the empty piece a trailing
+// newline would produce. NUL becomes U+FFFD here, which is the one place the
+// spec asks for a substitution and the reason `byteAt` can use 0 for "end".
+fn mdSplitLines(src: &string): Vec<string> {
+    var out: Vec<string> = Vec.new()
+    var cur = ""
+    var i: i64 = 0
+    while i < src.len {
+        let c = src[i]
+        if c == '\n' {
+            out.push(cur.clone())
+            cur = ""
+            i = i + 1
+        } else if c == '\r' {
+            out.push(cur.clone())
+            cur = ""
+            if byteAt(src, i + 1) == '\n' {
+                i = i + 2
+            } else {
+                i = i + 1
+            }
+        } else if c == 0 {
+            encodeCodepoint(cur, 65533)
+            i = i + 1
+        } else {
+            cur.push(c)
+            i = i + 1
+        }
+    }
+    if cur.len > 0 {
+        out.push(cur.clone())
+    }
+    return out
+}
+
+// Drop the trailing run of blank lines. `keepNewline` leaves one final newline,
+// which is what a code block's content needs and an html block's does not.
+fn stripTrailingBlankLines(s: &string, keepNewline: bool): string {
+    var end = s.len
+    var going = true
+    while going {
+        var e = end
+        while e > 0 && (s[e - 1] == ' ' || s[e - 1] == '\t') {
+            e = e - 1
+        }
+        if e > 0 && s[e - 1] == '\n' {
+            end = e - 1
+        } else {
+            going = false
+        }
+    }
+    var out = s.substr(0, end)
+    if keepNewline && out.len > 0 {
+        out.push('\n')
+    }
+    return out
+}
+
+// Remove an ATX heading's optional closing run of #s: `## foo ##` is `foo`, but
+// `## foo#` is `foo#` — the run has to be preceded by a space.
+fn stripAtxTrailing(s: &string): string {
+    var end = s.len
+    while end > 0 && isSpaceOrTab(s[end - 1]) {
+        end = end - 1
+    }
+    var h = end
+    while h > 0 && s[h - 1] == '#' {
+        h = h - 1
+    }
+    if h < end {
+        if h == 0 {
+            return ""
+        }
+        if isSpaceOrTab(s[h - 1]) {
+            var e2 = h
+            while e2 > 0 && isSpaceOrTab(s[e2 - 1]) {
+                e2 = e2 - 1
+            }
+            return s.substr(0, e2)
+        }
+    }
+    return s.substr(0, end)
+}
+
+// ── Inline phase ─────────────────────────────────────────────────────────────
+
+struct DelimScan {
+    numdelims: i64,
+    canOpen: bool,
+    canClose: bool,
+}
+
+// Codepoint immediately before byte `at`, or '\n' at the start of the subject —
+// the spec treats the beginning of a line as whitespace for flanking purposes.
+fn cpBefore(s: &string, at: i64): i32 {
+    if at <= 0 {
+        return 10
+    }
+    var i = at - 1
+    while i > 0 && (s[i] & 192) == 128 {
+        i = i - 1
+    }
+    let d = decodeCodepoint(s, i)
+    return d.value
+}
+
+fn cpAfter(s: &string, at: i64): i32 {
+    if at >= s.len {
+        return 10
+    }
+    let d = decodeCodepoint(s, at)
+    return d.value
+}
+
+// A code span's content: newlines fold to spaces, and one space is stripped from
+// each end when both ends have one and the content is not all spaces.
+fn collapseCodeSpan(raw: &string): string {
+    var out = ""
+    for c in raw {
+        if c == '\n' {
+            out.push(' ')
+        } else {
+            out.push(c)
+        }
+    }
+    if out.len >= 2 && out[0] == ' ' && out[out.len - 1] == ' ' {
+        var allSpace = true
+        for c in out {
+            if c != ' ' {
+                allSpace = false
+            }
+        }
+        if !allSpace {
+            return out.substr(1, out.len - 1)
+        }
+    }
+    return out
+}
+
+impl MdParser {
+    fn addText(self: &mut Self, block: i64, s: string): i64 {
+        let t = self.addNode(NodeKind.Text)
+        self.nodes[t].literal = s
+        self.appendChild(block, t)
+        return t
+    }
+
+    fn parseInlines(self: &mut Self, block: i64): void {
+        let content = self.nodes[block].content.clone()
+        self.subject = content.trim()
+        self.nodes[block].content = ""
+        self.ipos = 0
+        self.delims.clear()
+        self.delimTop = -1
+        self.brackets.clear()
+        self.bracketTop = -1
+        var going = true
+        while going {
+            going = self.parseInline(block)
+        }
+        self.processEmphasis(-1)
+        self.gfmAutolinkPass(block)
+    }
+
+    fn parseInline(self: &mut Self, block: i64): bool {
+        if self.ipos >= self.subject.len {
+            return false
+        }
+        let c = self.subject[self.ipos]
+        var res = false
+        if c == '\n' {
+            res = self.parseNewline(block)
+        } else if c == '\\' {
+            res = self.parseBackslash(block)
+        } else if c == '`' {
+            res = self.parseBackticks(block)
+        } else if c == '*' || c == '_' || c == '~' {
+            res = self.handleDelim(c, block)
+        } else if c == '[' {
+            res = self.parseOpenBracket(block)
+        } else if c == '!' {
+            res = self.parseBang(block)
+        } else if c == ']' {
+            res = self.parseCloseBracket(block)
+        } else if c == '<' {
+            res = self.parseAutolink(block)
+            if !res {
+                res = self.parseHtmlTag(block)
+            }
+        } else if c == '&' {
+            res = self.parseEntity(block)
+        } else {
+            res = self.parseString(block)
+        }
+        if !res {
+            self.ipos = self.ipos + 1
+            var lit = ""
+            lit.push(c)
+            self.addText(block, lit)
+        }
+        return true
+    }
+
+    fn parseNewline(self: &mut Self, block: i64): bool {
+        self.ipos = self.ipos + 1
+        var hard = false
+        let last = self.nodes[block].lastChild
+        if last >= 0 && isKind(self.nodes[last].kind, NodeKind.Text) {
+            let lit = self.nodes[last].literal.clone()
+            if lit.len > 0 && lit[lit.len - 1] == ' ' {
+                // Two or more trailing spaces before the newline is a hard break.
+                hard = lit.len > 1 && lit[lit.len - 2] == ' '
+                var e = lit.len
+                while e > 0 && lit[e - 1] == ' ' {
+                    e = e - 1
+                }
+                self.nodes[last].literal = lit.substr(0, e)
+            }
+        }
+        var br = self.addNode(NodeKind.SoftBreak)
+        if hard {
+            self.nodes[br].kind = NodeKind.LineBreak
+        }
+        self.appendChild(block, br)
+        // Leading whitespace on the next line is not content.
+        while byteAt(self.subject, self.ipos) == ' ' || byteAt(self.subject, self.ipos) == '\t' {
+            self.ipos = self.ipos + 1
+        }
+        return true
+    }
+
+    fn parseBackslash(self: &mut Self, block: i64): bool {
+        self.ipos = self.ipos + 1
+        let c = byteAt(self.subject, self.ipos)
+        if c == '\n' {
+            self.ipos = self.ipos + 1
+            let br = self.addNode(NodeKind.LineBreak)
+            self.appendChild(block, br)
+            return true
+        }
+        if isAsciiPunct(c) {
+            var lit = ""
+            lit.push(c)
+            self.addText(block, lit)
+            self.ipos = self.ipos + 1
+            return true
+        }
+        self.addText(block, "\\")
+        return true
+    }
+
+    fn parseBackticks(self: &mut Self, block: i64): bool {
+        let start = self.ipos
+        var n: i64 = 0
+        while byteAt(self.subject, self.ipos) == '`' {
+            n = n + 1
+            self.ipos = self.ipos + 1
+        }
+        let afterOpen = self.ipos
+        var i = afterOpen
+        while i < self.subject.len {
+            if self.subject[i] == '`' {
+                var m: i64 = 0
+                var j = i
+                while j < self.subject.len && self.subject[j] == '`' {
+                    m = m + 1
+                    j = j + 1
+                }
+                if m == n {
+                    let raw = self.subject.substr(afterOpen, i)
+                    let body = collapseCodeSpan(raw)
+                    let c = self.addNode(NodeKind.Code)
+                    self.nodes[c].literal = body
+                    self.appendChild(block, c)
+                    self.ipos = j
+                    return true
+                }
+                i = j
+            } else {
+                i = i + 1
+            }
+        }
+        // No closing run of the same length: the opener is literal text.
+        self.ipos = afterOpen
+        let lit = self.subject.substr(start, afterOpen)
+        self.addText(block, lit)
+        return true
+    }
+
+    fn parseEntity(self: &mut Self, block: i64): bool {
+        let start = self.ipos
+        let end = scanEntity(self.subject, start)
+        if end < 0 {
+            return false
+        }
+        let raw = self.subject.substr(start, end)
+        let decoded = decodeEntityRef(raw)
+        self.ipos = end
+        self.addText(block, decoded)
+        return true
+    }
+
+    fn parseHtmlTag(self: &mut Self, block: i64): bool {
+        let end = scanHtmlInline(self.subject, self.ipos)
+        if end < 0 {
+            return false
+        }
+        let raw = self.subject.substr(self.ipos, end)
+        let h = self.addNode(NodeKind.HtmlInline)
+        self.nodes[h].literal = raw
+        self.appendChild(block, h)
+        self.ipos = end
+        return true
+    }
+
+    fn parseAutolink(self: &mut Self, block: i64): bool {
+        let close = scanAutolinkUri(self.subject, self.ipos)
+        if close > 0 {
+            let dest = self.subject.substr(self.ipos + 1, close)
+            let node = self.addNode(NodeKind.Link)
+            self.nodes[node].dest = dest.clone()
+            self.appendChild(block, node)
+            self.addText(node, dest.clone())
+            self.ipos = close + 1
+            return true
+        }
+        let mail = scanAutolinkEmail(self.subject, self.ipos)
+        if mail > 0 {
+            let addr = self.subject.substr(self.ipos + 1, mail)
+            let node = self.addNode(NodeKind.Link)
+            self.nodes[node].dest = "mailto:" + addr
+            self.appendChild(block, node)
+            self.addText(node, addr.clone())
+            self.ipos = mail + 1
+            return true
+        }
+        return false
+    }
+
+    fn parseString(self: &mut Self, block: i64): bool {
+        let start = self.ipos
+        var i = start
+        while i < self.subject.len {
+            let c = self.subject[i]
+            if c == '\n' || c == '`' || c == '[' || c == ']' || c == '\\' || c == '!'
+            || c == '<' || c == '&' || c == '*' || c == '_' || c == '~' {
+                break
+            }
+            i = i + 1
+        }
+        if i == start {
+            return false
+        }
+        let lit = self.subject.substr(start, i)
+        self.ipos = i
+        self.addText(block, lit)
+        return true
+    }
+
+    // ── Emphasis ─────────────────────────────────────────────────────────────
+
+    fn scanDelims(self: &mut Self, cc: u8): DelimScan {
+        var numdelims: i64 = 0
+        let startpos = self.ipos
+        while byteAt(self.subject, self.ipos) == cc {
+            numdelims = numdelims + 1
+            self.ipos = self.ipos + 1
+        }
+        if numdelims == 0 {
+            return DelimScan {
+                numdelims: 0, canOpen: false, canClose: false
+            }
+        }
+        let before = cpBefore(self.subject, startpos)
+        let after = cpAfter(self.subject, self.ipos)
+        let afterWs = isUnicodeWhitespaceCp(after)
+        let afterPunct = isUnicodePunctCp(after)
+        let beforeWs = isUnicodeWhitespaceCp(before)
+        let beforePunct = isUnicodePunctCp(before)
+        let leftFlanking = !afterWs && (!afterPunct || beforeWs || beforePunct)
+        let rightFlanking = !beforeWs && (!beforePunct || afterWs || afterPunct)
+        var canOpen = leftFlanking
+        var canClose = rightFlanking
+        // `_` may not open or close inside a word: intra-word emphasis is a
+        // snake_case hazard, and the spec singles it out.
+        if cc == '_' {
+            canOpen = leftFlanking && (!rightFlanking || beforePunct)
+            canClose = rightFlanking && (!leftFlanking || afterPunct)
+        }
+        self.ipos = startpos
+        return DelimScan {
+            numdelims: numdelims, canOpen: canOpen, canClose: canClose
+        }
+    }
+
+    fn handleDelim(self: &mut Self, cc: u8, block: i64): bool {
+        let scan = self.scanDelims(cc)
+        if scan.numdelims == 0 {
+            return false
+        }
+        // GFM strikethrough is at most a double tilde; a longer run is literal.
+        if cc == '~' && scan.numdelims > 2 {
+            let start = self.ipos
+            self.ipos = self.ipos + scan.numdelims
+            let lit = self.subject.substr(start, self.ipos)
+            self.addText(block, lit)
+            return true
+        }
+        let start = self.ipos
+        self.ipos = self.ipos + scan.numdelims
+        let lit = self.subject.substr(start, self.ipos)
+        let node = self.addText(block, lit)
+        let id = self.delims.len
+        self.delims.push(Delim {
+            cc: cc,
+            numdelims: scan.numdelims,
+            origdelims: scan.numdelims,
+            node: node,
+            prev: self.delimTop,
+            next: -1,
+            canOpen: scan.canOpen,
+            canClose: scan.canClose,
+        }
+        )
+        if self.delimTop >= 0 {
+            self.delims[self.delimTop].next = id
+        }
+        self.delimTop = id
+        return true
+    }
+
+    fn removeDelimiter(self: &mut Self, d: i64): void {
+        let pv = self.delims[d].prev
+        let nx = self.delims[d].next
+        if pv >= 0 {
+            self.delims[pv].next = nx
+        }
+        if nx < 0 {
+            self.delimTop = pv
+        } else {
+            self.delims[nx].prev = pv
+        }
+    }
+
+    fn removeDelimsBetween(self: &mut Self, bottom: i64, top: i64): void {
+        if self.delims[top].prev != bottom {
+            self.delims[top].prev = bottom
+            self.delims[bottom].next = top
+        }
+    }
+
+    // The spec's "process emphasis" algorithm: walk the delimiter stack looking
+    // for closers, and for each, look back for the nearest matching opener.
+    // `openersBottom` is what keeps a failed search from being quadratic, and
+    // the `% 3` rule is the spec's fix for `***foo***`-style runs.
+    fn processEmphasis(self: &mut Self, stackBottom: i64): void {
+        // One bottom per (delimiter char, run length mod 3, can-also-open).
+        // The last of those three is easy to miss and its absence is invisible
+        // on the spec suite: it only shows up on runs like `****a**b***c****`,
+        // where a closer that could also have opened must not lower the bar for
+        // a later closer that could not.
+        var openersBottom: Vec<i64> = Vec.new()
+        for i in 0..20 {
+            openersBottom.push(stackBottom)
+        }
+
+        var closer = self.delimTop
+        while closer >= 0 && self.delims[closer].prev != stackBottom {
+            closer = self.delims[closer].prev
+        }
+
+        while closer >= 0 {
+            let cc = self.delims[closer].cc
+            if !self.delims[closer].canClose {
+                closer = self.delims[closer].next
+                continue
+            }
+            var slot = self.delims[closer].origdelims % 3
+            if self.delims[closer].canOpen {
+                slot = slot + 3
+            }
+            if cc == '_' {
+                slot = slot + 2
+            } else if cc == '*' {
+                slot = slot + 8
+            } else {
+                slot = slot + 14
+            }
+            var opener = self.delims[closer].prev
+            var openerFound = false
+            while opener >= 0 && opener != stackBottom && opener != openersBottom[slot] {
+                let oddMatch = (self.delims[closer].canOpen || self.delims[opener].canClose)
+                && (self.delims[closer].origdelims % 3 != 0)
+                && ((self.delims[opener].origdelims + self.delims[closer].origdelims) % 3 == 0)
+                if self.delims[opener].cc == cc && self.delims[opener].canOpen && !oddMatch {
+                    openerFound = true
+                    break
+                }
+                opener = self.delims[opener].prev
+            }
+            let oldCloser = closer
+
+            if !openerFound {
+                closer = self.delims[closer].next
+            } else if cc == '~' {
+                // GFM: the runs must be the same length, and `~~~` is not
+                // strikethrough at all.
+                if self.delims[opener].numdelims != self.delims[closer].numdelims {
+                    closer = self.delims[closer].next
+                } else {
+                    let n = self.delims[closer].numdelims
+                    closer = self.wrapDelims(opener, closer, NodeKind.Strike, n)
+                }
+            } else {
+                var useDelims: i64 = 1
+                if self.delims[closer].numdelims >= 2 && self.delims[opener].numdelims >= 2 {
+                    useDelims = 2
+                }
+                var kind = NodeKind.Emph
+                if useDelims == 2 {
+                    kind = NodeKind.Strong
+                }
+                closer = self.wrapDelims(opener, closer, kind, useDelims)
+            }
+
+            if !openerFound {
+                openersBottom[slot] = self.delims[oldCloser].prev
+                if !self.delims[oldCloser].canOpen {
+                    self.removeDelimiter(oldCloser)
+                }
+            }
+        }
+
+        while self.delimTop >= 0 && self.delimTop != stackBottom {
+            let t = self.delimTop
+            self.removeDelimiter(t)
+        }
+    }
+
+    // Wrap everything between two delimiter runs in an emphasis node, consuming
+    // `useDelims` characters from each. Returns the next closer to examine.
+    fn wrapDelims(self: &mut Self, opener: i64, closer: i64, kind: NodeKind, useDelims: i64): i64 {
+        let openerNode = self.delims[opener].node
+        let closerNode = self.delims[closer].node
+        self.delims[opener].numdelims = self.delims[opener].numdelims - useDelims
+        self.delims[closer].numdelims = self.delims[closer].numdelims - useDelims
+
+        let ol = self.nodes[openerNode].literal.clone()
+        self.nodes[openerNode].literal = ol.substr(0, ol.len - useDelims)
+        let cl = self.nodes[closerNode].literal.clone()
+        self.nodes[closerNode].literal = cl.substr(0, cl.len - useDelims)
+
+        let emph = self.addNode(kind)
+        var tmp = self.nodes[openerNode].next
+        while tmp >= 0 && tmp != closerNode {
+            let nxt = self.nodes[tmp].next
+            self.unlinkNode(tmp)
+            self.appendChild(emph, tmp)
+            tmp = nxt
+        }
+        self.insertAfter(openerNode, emph)
+        self.removeDelimsBetween(opener, closer)
+
+        if self.delims[opener].numdelims == 0 {
+            self.unlinkNode(openerNode)
+            self.removeDelimiter(opener)
+        }
+        if self.delims[closer].numdelims == 0 {
+            self.unlinkNode(closerNode)
+            let nxt = self.delims[closer].next
+            self.removeDelimiter(closer)
+            return nxt
+        }
+        return closer
+    }
+
+    // ── Links, images and reference definitions ──────────────────────────────
+
+    fn addBracket(self: &mut Self, node: i64, index: i64, image: bool): void {
+        if self.bracketTop >= 0 {
+            self.brackets[self.bracketTop].bracketAfter = true
+        }
+        let id = self.brackets.len
+        let top = self.bracketTop
+        let dtop = self.delimTop
+        self.brackets.push(Bracket {
+            node: node, prev: top, prevDelim: dtop, index: index,
+            image: image, active: true, bracketAfter: false,
+        }
+        )
+        self.bracketTop = id
+    }
+
+    fn removeBracket(self: &mut Self): void {
+        if self.bracketTop >= 0 {
+            self.bracketTop = self.brackets[self.bracketTop].prev
+        }
+    }
+
+    fn parseOpenBracket(self: &mut Self, block: i64): bool {
+        let startpos = self.ipos
+        self.ipos = self.ipos + 1
+        let node = self.addText(block, "[")
+        self.addBracket(node, startpos, false)
+        return true
+    }
+
+    fn parseBang(self: &mut Self, block: i64): bool {
+        let startpos = self.ipos
+        self.ipos = self.ipos + 1
+        if byteAt(self.subject, self.ipos) == '[' {
+            self.ipos = self.ipos + 1
+            let node = self.addText(block, "![")
+            self.addBracket(node, startpos + 1, true)
+            return true
+        }
+        self.addText(block, "!")
+        return true
+    }
+
+    fn parseCloseBracket(self: &mut Self, block: i64): bool {
+        self.ipos = self.ipos + 1
+        let startpos = self.ipos
+        let opener = self.bracketTop
+        if opener < 0 {
+            self.addText(block, "]")
+            return true
+        }
+        if !self.brackets[opener].active {
+            self.addText(block, "]")
+            self.removeBracket()
+            return true
+        }
+        let isImage = self.brackets[opener].image
+        let savepos = self.ipos
+        var matched = false
+        var dest = ""
+        var title = ""
+
+        // inline link: `](dest "title")`
+        if byteAt(self.subject, self.ipos) == '(' {
+            self.ipos = self.ipos + 1
+            self.spnl()
+            let d = self.parseLinkDestination()
+            if d.ok {
+                let beforeSpnl = self.ipos
+                self.spnl()
+                if self.ipos > beforeSpnl {
+                    // A title must be separated from the destination by
+                    // whitespace, otherwise `(foo"bar")` would take a title.
+                    let t = self.parseLinkTitle()
+                    if t.ok {
+                        title = t.value.clone()
+                        self.spnl()
+                    }
+                }
+                if byteAt(self.subject, self.ipos) == ')' {
+                    self.ipos = self.ipos + 1
+                    dest = d.value.clone()
+                    matched = true
+                }
+            }
+            if !matched {
+                self.ipos = savepos
+                title = ""
+            }
+        }
+
+        // reference link: full `][label]`, collapsed `][]`, or shortcut `]`
+        if !matched {
+            let beforeLabel = self.ipos
+            let n = self.parseLinkLabel()
+            var reflabel = ""
+            var haveLabel = false
+            if n > 2 {
+                reflabel = self.subject.substr(beforeLabel, beforeLabel + n)
+                haveLabel = true
+            } else if !self.brackets[opener].bracketAfter {
+                let from = self.brackets[opener].index
+                reflabel = self.subject.substr(from, startpos)
+                haveLabel = true
+            }
+            if n == 0 {
+                self.ipos = savepos
+            }
+            if haveLabel {
+                let norm = normalizeReference(reflabel)
+                match self.refKeys.get(norm) {
+                    Option.Some(idx) => {
+                        dest = self.refDest[idx].clone()
+                        title = self.refTitle[idx].clone()
+                        matched = true
+                    }
+                    Option.None => {
+                    }
+                }
+            }
+        }
+
+        if !matched {
+            self.removeBracket()
+            self.ipos = startpos
+            self.addText(block, "]")
+            return true
+        }
+
+        var kind = NodeKind.Link
+        if isImage {
+            kind = NodeKind.Image
+        }
+        let node = self.addNode(kind)
+        self.nodes[node].dest = dest
+        self.nodes[node].title = title
+        let openerNode = self.brackets[opener].node
+        var tmp = self.nodes[openerNode].next
+        while tmp >= 0 {
+            let nxt = self.nodes[tmp].next
+            self.unlinkNode(tmp)
+            self.appendChild(node, tmp)
+            tmp = nxt
+        }
+        self.appendChild(block, node)
+        let bottom = self.brackets[opener].prevDelim
+        self.processEmphasis(bottom)
+        self.removeBracket()
+        self.unlinkNode(openerNode)
+
+        // Links may not nest: every earlier link opener is dead.
+        if !isImage {
+            var b = self.bracketTop
+            while b >= 0 {
+                if !self.brackets[b].image {
+                    self.brackets[b].active = false
+                }
+                b = self.brackets[b].prev
+            }
+        }
+        return true
+    }
+
+    // Optional spaces/tabs and at most one line ending.
+    fn spnl(self: &mut Self): void {
+        var seenNewline = false
+        while self.ipos < self.subject.len {
+            let c = self.subject[self.ipos]
+            if c == ' ' || c == '\t' {
+                self.ipos = self.ipos + 1
+            } else if c == '\n' && !seenNewline {
+                seenNewline = true
+                self.ipos = self.ipos + 1
+            } else {
+                break
+            }
+        }
+    }
+
+    fn parseLinkDestination(self: &mut Self): StrResult {
+        if byteAt(self.subject, self.ipos) == '<' {
+            var i = self.ipos + 1
+            while i < self.subject.len {
+                let c = self.subject[i]
+                if c == '>' {
+                    let raw = self.subject.substr(self.ipos + 1, i)
+                    self.ipos = i + 1
+                    return StrResult {
+                        ok: true, value: unescapeString(raw)
+                    }
+                }
+                if c == '\n' || c == '<' {
+                    return StrResult {
+                        ok: false, value: ""
+                    }
+                }
+                if c == '\\' && i + 1 < self.subject.len {
+                    i = i + 2
+                } else {
+                    i = i + 1
+                }
+            }
+            return StrResult {
+                ok: false, value: ""
+            }
+        }
+        let save = self.ipos
+        var openParens: i64 = 0
+        var i = self.ipos
+        var stopByte: u8 = 0
+        while i < self.subject.len {
+            let c = self.subject[i]
+            if c == '\\' && i + 1 < self.subject.len && isAsciiPunct(self.subject[i + 1]) {
+                i = i + 2
+                continue
+            }
+            if c == '(' {
+                openParens = openParens + 1
+                i = i + 1
+                continue
+            }
+            if c == ')' {
+                if openParens < 1 {
+                    stopByte = c
+                    break
+                }
+                openParens = openParens - 1
+                i = i + 1
+                continue
+            }
+            if c == ' ' || c == '\t' || c == '\n' || c == 11 || c == 12 || c == '\r' {
+                stopByte = c
+                break
+            }
+            i = i + 1
+        }
+        if i == save && stopByte != ')' {
+            return StrResult {
+                ok: false, value: ""
+            }
+        }
+        if openParens != 0 {
+            return StrResult {
+                ok: false, value: ""
+            }
+        }
+        let raw = self.subject.substr(save, i)
+        self.ipos = i
+        return StrResult {
+            ok: true, value: unescapeString(raw)
+        }
+    }
+
+    fn parseLinkTitle(self: &mut Self): StrResult {
+        let q = byteAt(self.subject, self.ipos)
+        var closer: u8 = 0
+        if q == '"' {
+            closer = '"'
+        } else if q == '\'' {
+            closer = '\''
+        } else if q == '(' {
+            closer = ')'
+        } else {
+            return StrResult {
+                ok: false, value: ""
+            }
+        }
+        var i = self.ipos + 1
+        while i < self.subject.len {
+            let c = self.subject[i]
+            if c == '\\' && i + 1 < self.subject.len {
+                i = i + 2
+                continue
+            }
+            if c == closer {
+                let raw = self.subject.substr(self.ipos + 1, i)
+                self.ipos = i + 1
+                return StrResult {
+                    ok: true, value: unescapeString(raw)
+                }
+            }
+            // An unescaped `(` may not appear inside a parenthesised title.
+            if q == '(' && c == '(' {
+                return StrResult {
+                    ok: false, value: ""
+                }
+            }
+            i = i + 1
+        }
+        return StrResult {
+            ok: false, value: ""
+        }
+    }
+
+    // Length of a `[...]` label at the cursor (brackets included), or 0. On a
+    // match the cursor moves past the label — the caller rewinds when it turns
+    // out not to want it.
+    fn parseLinkLabel(self: &mut Self): i64 {
+        if byteAt(self.subject, self.ipos) != '[' {
+            return 0
+        }
+        var i = self.ipos + 1
+        var count: i64 = 0
+        while i < self.subject.len {
+            let c = self.subject[i]
+            if c == '\\' && i + 1 < self.subject.len {
+                i = i + 2
+                count = count + 2
+                continue
+            }
+            if c == '[' {
+                return 0
+            }
+            if c == ']' {
+                if count > 999 {
+                    return 0
+                }
+                let used = i + 1 - self.ipos
+                self.ipos = i + 1
+                return used
+            }
+            i = i + 1
+            count = count + 1
+        }
+        return 0
+    }
+
+    // Parse one link reference definition off the front of `content`, returning
+    // how many bytes it used (0 if there is not one there).
+    fn parseReference(self: &mut Self, content: &string): i64 {
+        self.subject = content.clone()
+        self.ipos = 0
+        let labelLen = self.parseLinkLabel()
+        if labelLen == 0 {
+            return 0
+        }
+        let rawlabel = self.subject.substr(0, labelLen)
+        self.ipos = labelLen
+        if byteAt(self.subject, self.ipos) != ':' {
+            return 0
+        }
+        self.ipos = self.ipos + 1
+        self.spnl()
+        let d = self.parseLinkDestination()
+        if !d.ok {
+            return 0
+        }
+        let beforeTitle = self.ipos
+        self.spnl()
+        var title = ""
+        var haveTitle = false
+        if self.ipos != beforeTitle {
+            let t = self.parseLinkTitle()
+            if t.ok {
+                title = t.value.clone()
+                haveTitle = true
+            }
+        }
+        if !haveTitle {
+            self.ipos = beforeTitle
+        }
+        // The definition must end its line. If a title was found but something
+        // follows it, the definition may still be legal without the title.
+        var atLineEnd = self.skipToLineEnd()
+        if !atLineEnd && haveTitle {
+            title = ""
+            self.ipos = beforeTitle
+            atLineEnd = self.skipToLineEnd()
+        }
+        if !atLineEnd {
+            return 0
+        }
+        let norm = normalizeReference(rawlabel)
+        if norm.len == 0 {
+            return 0
+        }
+        // First definition wins; a later one with the same label is ignored.
+        if !self.refKeys.contains(norm) {
+            let idx = self.refDest.len
+            self.refDest.push(d.value.clone())
+            self.refTitle.push(title.clone())
+            self.refKeys.insert(norm.clone(), idx)
+        }
+        return self.ipos
+    }
+
+    // Consume trailing spaces plus one newline; false if anything else is left.
+    fn skipToLineEnd(self: &mut Self): bool {
+        var i = self.ipos
+        while i < self.subject.len && (self.subject[i] == ' ' || self.subject[i] == '\t') {
+            i = i + 1
+        }
+        if i >= self.subject.len {
+            self.ipos = i
+            return true
+        }
+        if self.subject[i] == '\n' {
+            self.ipos = i + 1
+            return true
+        }
+        return false
+    }
+
+    // ── GFM extended autolinks ───────────────────────────────────────────────
+
+    // Bare URLs become links in a pass over the finished inline tree, not during
+    // the inline scan. cmark-gfm does it the same way and for the same reason:
+    // running it inline lets a URL swallow the `]` that closes the link label it
+    // sits inside, and links cannot nest anyway.
+    fn gfmAutolinkPass(self: &mut Self, parent: i64): void {
+        var c = self.nodes[parent].firstChild
+        while c >= 0 {
+            let k = self.nodes[c].kind
+            if isKind(k, NodeKind.Text) {
+                // A URL can span several text nodes: the inline parser splits
+                // text at every `_`, `~` or failed `&entity;`, and
+                // `www.a.com/x_(y)` is one link to GFM, not three fragments.
+                var last = c
+                var buf = self.nodes[c].literal.clone()
+                var n = self.nodes[c].next
+                while n >= 0 && isKind(self.nodes[n].kind, NodeKind.Text) {
+                    buf.pushStr(self.nodes[n].literal)
+                    last = n
+                    n = self.nodes[n].next
+                }
+                self.rewriteAutolinkRun(c, last, buf)
+                c = n
+            } else {
+                if !isKind(k, NodeKind.Link) && !isKind(k, NodeKind.Image) && !isKind(k, NodeKind.Code) {
+                    self.gfmAutolinkPass(c)
+                }
+                c = self.nodes[c].next
+            }
+        }
+    }
+
+    // Replace a run of text nodes whose combined text contains bare URLs with
+    // the text/link sequence it should have been. Leaves the run alone when
+    // there is no URL in it.
+    fn rewriteAutolinkRun(self: &mut Self, first: i64, last: i64, buf: string): void {
+        var anchor = last
+        var lastEmit: i64 = 0
+        var found = false
+        var i: i64 = 0
+        while i < buf.len {
+            let c = buf[i]
+            if (c == 'w' || c == 'W' || c == 'h' || c == 'H') && autolinkBoundary(buf, i) {
+                let prefix = gfmAutolinkPrefix(buf, i)
+                if prefix > 0 {
+                    let end = gfmUrlEnd(buf, i)
+                    let raw = buf.substr(i, end)
+                    if end > i + prefix && gfmValidDomain(raw, prefix) {
+                        if i > lastEmit {
+                            let t = self.addNode(NodeKind.Text)
+                            let between = buf.substr(lastEmit, i)
+                            self.nodes[t].literal = between
+                            self.insertAfter(anchor, t)
+                            anchor = t
+                        }
+                        var dest = raw.clone()
+                        if prefix == 4 {
+                            // a bare `www.` link gets an http:// scheme
+                            dest = "http://" + raw
+                        }
+                        let l = self.addNode(NodeKind.Link)
+                        self.nodes[l].dest = dest
+                        self.insertAfter(anchor, l)
+                        anchor = l
+                        let tx = self.addNode(NodeKind.Text)
+                        self.nodes[tx].literal = raw.clone()
+                        self.appendChild(l, tx)
+                        found = true
+                        lastEmit = end
+                        i = end
+                        continue
+                    }
+                }
+            }
+            i = i + 1
+        }
+        if !found {
+            return
+        }
+        if lastEmit < buf.len {
+            let t = self.addNode(NodeKind.Text)
+            let tail = buf.substr(lastEmit, buf.len)
+            self.nodes[t].literal = tail
+            self.insertAfter(anchor, t)
+        }
+        // The originals are gone: their text is now spread across the new
+        // nodes, so leaving any of them in would duplicate it.
+        var old: Vec<i64> = Vec.new()
+        var p = first
+        var going = true
+        while going {
+            old.push(p)
+            if p == last {
+                going = false
+            } else {
+                p = self.nodes[p].next
+            }
+        }
+        for j in 0..old.len {
+            self.unlinkNode(old[j])
+        }
+    }
+
+    // ── GFM tables ───────────────────────────────────────────────────────────
+    //
+    // A table starts when a one-line paragraph is followed by a delimiter row
+    // with the same number of cells. Requiring the header to be the paragraph's
+    // only line is a deliberate simplification of GFM, which splits a longer
+    // paragraph at its last line; it costs a table that is glued to the
+    // paragraph above it, which is not a shape anyone writes on purpose.
+
+    fn tryTableStart(self: &mut Self, container: i64): bool {
+        let content = self.nodes[container].content.clone()
+        let header = content.trim()
+        if header.len == 0 || header.contains("\n") || !header.contains("|") {
+            return false
+        }
+        let rest = self.line.substr(self.nextNonspace, self.line.len)
+        if !rest.contains("|") {
+            return false
+        }
+        let aligns = parseDelimRow(rest)
+        if aligns.len == 0 {
+            return false
+        }
+        let cells = splitTableCells(header)
+        if cells.len != aligns.len {
+            return false
+        }
+
+        self.closeUnmatchedBlocks()
+        let t = self.addNode(NodeKind.Table)
+        self.nodes[t].level = aligns.len
+        self.insertAfter(container, t)
+        self.unlinkNode(container)
+        self.tip = t
+
+        let row = self.addNode(NodeKind.TableRow)
+        self.nodes[row].isHeader = true
+        // Rows and cells are finished the moment they are built; leaving them
+        // open would make the next line's container walk descend into them.
+        self.nodes[row].open = false
+        self.appendChild(t, row)
+        for i in 0..cells.len {
+            let cell = self.addNode(NodeKind.TableCell)
+            self.nodes[cell].isHeader = true
+            self.nodes[cell].open = false
+            self.nodes[cell].level = aligns[i]
+            let text = cells[i].clone()
+            self.nodes[cell].content = text
+            self.appendChild(row, cell)
+        }
+        let remaining = self.line.len - self.pos
+        self.advanceOffset(remaining, false)
+        return true
+    }
+
+    fn tableLineEnds(self: &Self): bool {
+        if self.indented {
+            return false
+        }
+        let at = self.nextNonspace
+        let c = byteAt(self.line, at)
+        if c == '>' {
+            return true
+        }
+        if scanAtxMarker(self.line, at) > 0 {
+            return true
+        }
+        if scanCodeFence(self.line, at) > 0 {
+            return true
+        }
+        if isThematicBreak(self.line, at) {
+            return true
+        }
+        return false
+    }
+
+    fn finalizeTable(self: &mut Self, block: i64): void {
+        let content = self.nodes[block].content.clone()
+        self.nodes[block].content = ""
+        let ncols = self.nodes[block].level
+        var aligns: Vec<i64> = Vec.new()
+        let hrow = self.nodes[block].firstChild
+        if hrow >= 0 {
+            var c = self.nodes[hrow].firstChild
+            while c >= 0 {
+                aligns.push(self.nodes[c].level)
+                c = self.nodes[c].next
+            }
+        }
+        let lines = mdSplitLines(content)
+        for i in 0..lines.len {
+            let raw = lines[i].clone()
+            if isBlankStr(raw) {
+                continue
+            }
+            let cells = splitTableCells(raw.trim())
+            let row = self.addNode(NodeKind.TableRow)
+            self.nodes[row].open = false
+            self.appendChild(block, row)
+            // A row is padded with empty cells or truncated to the header's
+            // width, which is what GFM specifies.
+            for j in 0..ncols {
+                let cell = self.addNode(NodeKind.TableCell)
+                self.nodes[cell].open = false
+                if j < aligns.len {
+                    self.nodes[cell].level = aligns[j]
+                }
+                if j < cells.len {
+                    let text = cells[j].clone()
+                    self.nodes[cell].content = text
+                }
+                self.appendChild(row, cell)
+            }
+        }
+    }
+
+    // ── GFM task list items ──────────────────────────────────────────────────
+    //
+    // Run after the block phase and before inlines: the marker is the first
+    // thing in the item's first paragraph, and stripping it there keeps it out
+    // of the inline parse (where `[ ]` would look like a link label).
+    fn markTaskItems(self: &mut Self, node: i64): void {
+        if isKind(self.nodes[node].kind, NodeKind.Item) {
+            let p = self.nodes[node].firstChild
+            if p >= 0 && isKind(self.nodes[p].kind, NodeKind.Paragraph) {
+                let c = self.nodes[p].content.clone()
+                if c.len >= 3 && c[0] == '[' && c[2] == ']' && (c[1] == ' ' || c[1] == 'x' || c[1] == 'X') {
+                    let after = byteAt(c, 3)
+                    if after == 0 || after == ' ' || after == '\t' || after == '\n' {
+                        if c[1] == ' ' {
+                            self.nodes[node].taskState = 1
+                        } else {
+                            self.nodes[node].taskState = 2
+                        }
+                        let rest = c.substr(3, c.len)
+                        self.nodes[p].content = rest
+                    }
+                }
+            }
+        }
+        var ch = self.nodes[node].firstChild
+        while ch >= 0 {
+            let nx = self.nodes[ch].next
+            self.markTaskItems(ch)
+            ch = nx
+        }
+    }
+}
+
+struct StrResult {
+    ok: bool,
+    value: string,
+}
+
+// Split one table row into trimmed cell texts. `\|` is a literal pipe (GFM
+// makes the backslash the only way to get one, even inside a code span), and
+// the optional leading and trailing pipes are not cell boundaries.
+fn splitTableCells(line: &string): Vec<string> {
+    var out: Vec<string> = Vec.new()
+    let s = line.trim()
+    var start: i64 = 0
+    var end = s.len
+    if end > 0 && s[0] == '|' {
+        start = 1
+    }
+    if end > start && s[end - 1] == '|' {
+        if !(end >= 2 && s[end - 2] == '\\') {
+            end = end - 1
+        }
+    }
+    var cur = ""
+    var i = start
+    while i < end {
+        let c = s[i]
+        if c == '\\' && i + 1 < end && s[i + 1] == '|' {
+            cur.push('|')
+            i = i + 2
+            continue
+        }
+        if c == '\\' && i + 1 < end {
+            cur.push(c)
+            cur.push(s[i + 1])
+            i = i + 2
+            continue
+        }
+        if c == '|' {
+            out.push(cur.trim())
+            cur = ""
+            i = i + 1
+            continue
+        }
+        cur.push(c)
+        i = i + 1
+    }
+    out.push(cur.trim())
+    return out
+}
+
+// Column alignments for a delimiter row (`| --- | :-: |`), or an empty Vec if
+// this is not one. 0 none, 1 left, 2 center, 3 right.
+fn parseDelimRow(line: &string): Vec<i64> {
+    var out: Vec<i64> = Vec.new()
+    let cells = splitTableCells(line)
+    if cells.len == 0 {
+        return out
+    }
+    for i in 0..cells.len {
+        let c = cells[i].clone()
+        var j: i64 = 0
+        var left = false
+        var right = false
+        if j < c.len && c[j] == ':' {
+            left = true
+            j = j + 1
+        }
+        var dashes: i64 = 0
+        while j < c.len && c[j] == '-' {
+            dashes = dashes + 1
+            j = j + 1
+        }
+        if j < c.len && c[j] == ':' {
+            right = true
+            j = j + 1
+        }
+        if j != c.len || dashes == 0 {
+            out.clear()
+            return out
+        }
+        if left && right {
+            out.push(2)
+        } else if left {
+            out.push(1)
+        } else if right {
+            out.push(3)
+        } else {
+            out.push(0)
+        }
+    }
+    return out
+}
+
+// ── Autolink and entity scanners ─────────────────────────────────────────────
+
+// Index of the closing `>` of an `<scheme:...>` autolink, or -1.
+fn scanAutolinkUri(s: &string, at: i64): i64 {
+    if byteAt(s, at) != '<' {
+        return -1
+    }
+    var i = at + 1
+    if !isAlphaByte(byteAt(s, i)) {
+        return -1
+    }
+    var schemeLen: i64 = 0
+    while i < s.len {
+        let c = s[i]
+        if isAlnumByte(c) || c == '+' || c == '.' || c == '-' {
+            schemeLen = schemeLen + 1
+            i = i + 1
+        } else {
+            break
+        }
+    }
+    if schemeLen < 2 || schemeLen > 32 || byteAt(s, i) != ':' {
+        return -1
+    }
+    i = i + 1
+    while i < s.len {
+        let c = s[i]
+        if c == '>' {
+            return i
+        }
+        if c <= ' ' || c == '<' {
+            return -1
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// Index of the closing `>` of an `<user@host>` email autolink, or -1.
+fn scanAutolinkEmail(s: &string, at: i64): i64 {
+    if byteAt(s, at) != '<' {
+        return -1
+    }
+    var i = at + 1
+    var local: i64 = 0
+    while i < s.len {
+        let c = s[i]
+        if isAlnumByte(c) || c == '.' || c == '!' || c == '#' || c == '$' || c == '%'
+        || c == '&' || c == '\'' || c == '*' || c == '+' || c == '/' || c == '='
+        || c == '?' || c == '^' || c == '_' || c == '`' || c == '{' || c == '|'
+        || c == '}' || c == '~' || c == '-' {
+            local = local + 1
+            i = i + 1
+        } else {
+            break
+        }
+    }
+    if local == 0 || byteAt(s, i) != '@' {
+        return -1
+    }
+    i = i + 1
+    var labels: i64 = 0
+    while true {
+        var len: i64 = 0
+        if !isAlnumByte(byteAt(s, i)) {
+            return -1
+        }
+        while i < s.len && (isAlnumByte(s[i]) || s[i] == '-') {
+            len = len + 1
+            i = i + 1
+        }
+        if len > 63 || s[i - 1] == '-' {
+            return -1
+        }
+        labels = labels + 1
+        if byteAt(s, i) == '.' {
+            i = i + 1
+            continue
+        }
+        break
+    }
+    if byteAt(s, i) != '>' || labels == 0 {
+        return -1
+    }
+    return i
+}
+
+// A GFM autolink may only start at the beginning of a text run or after one of
+// these — the rule that keeps `foo.www.example.com` from linking mid-word.
+fn autolinkBoundary(s: &string, at: i64): bool {
+    if at == 0 {
+        return true
+    }
+    let p = s[at - 1]
+    return p == ' ' || p == '\t' || p == '\n' || p == '*' || p == '_' || p == '~' || p == '('
+}
+
+// Length of the `www.`/`http://`/`https://` prefix of a GFM extended autolink
+// at `at`, or 0.
+fn gfmAutolinkPrefix(s: &string, at: i64): i64 {
+    let rest = s[at..s.len]
+    let lower = toLowerStr(rest)
+    if lower.startsWith("www.") {
+        return 4
+    }
+    if lower.startsWith("https://") {
+        return 8
+    }
+    if lower.startsWith("http://") {
+        return 7
+    }
+    return 0
+}
+
+// Where a GFM extended autolink ends: trailing punctuation, unbalanced closing
+// parens and a trailing entity reference are not part of the link, because in
+// running text they are nearly always the sentence's punctuation.
+fn gfmUrlEnd(s: &string, start: i64): i64 {
+    var i = start
+    while i < s.len {
+        let c = s[i]
+        if c == ' ' || c == '\t' || c == '\n' || c == '<' {
+            break
+        }
+        i = i + 1
+    }
+    var going = true
+    while going && i > start {
+        let c = s[i - 1]
+        if c == '?' || c == '!' || c == '.' || c == ',' || c == ':' || c == '*'
+        || c == '_' || c == '~' || c == '\'' || c == '"' {
+            i = i - 1
+        } else if c == ')' {
+            var opens: i64 = 0
+            var closes: i64 = 0
+            for j in start..i {
+                if s[j] == '(' {
+                    opens = opens + 1
+                } else if s[j] == ')' {
+                    closes = closes + 1
+                }
+            }
+            if closes > opens {
+                i = i - 1
+            } else {
+                going = false
+            }
+        } else if c == ';' {
+            var j = i - 1
+            while j > start && isAlnumByte(s[j - 1]) {
+                j = j - 1
+            }
+            if j > start && s[j - 1] == '&' {
+                i = j - 1
+            } else {
+                going = false
+            }
+        } else {
+            going = false
+        }
+    }
+    return i
+}
+
+// A GFM autolink's domain must have a dot and a non-empty last label.
+fn gfmValidDomain(url: &string, prefixLen: i64): bool {
+    var i = prefixLen
+    var dots: i64 = 0
+    var lastLabel: i64 = 0
+    while i < url.len {
+        let c = url[i]
+        if c == '/' || c == '?' || c == '#' {
+            break
+        }
+        if c == '.' {
+            dots = dots + 1
+            lastLabel = 0
+        } else if c == ' ' {
+            return false
+        } else {
+            lastLabel = lastLabel + 1
+        }
+        i = i + 1
+    }
+    return dots > 0 && lastLabel > 0
+}
+
+// Index just past an `&name;` / `&#123;` / `&#x1F;` reference at `at`, or -1.
+fn scanEntity(s: &string, at: i64): i64 {
+    if byteAt(s, at) != '&' {
+        return -1
+    }
+    var i = at + 1
+    if byteAt(s, i) == '#' {
+        i = i + 1
+        var digits: i64 = 0
+        if byteAt(s, i) == 'x' || byteAt(s, i) == 'X' {
+            i = i + 1
+            while i < s.len && isHexByte(s[i]) && digits < 7 {
+                digits = digits + 1
+                i = i + 1
+            }
+            if digits == 0 || digits > 6 {
+                return -1
+            }
+        } else {
+            while i < s.len && isDigitByte(s[i]) && digits < 8 {
+                digits = digits + 1
+                i = i + 1
+            }
+            if digits == 0 || digits > 7 {
+                return -1
+            }
+        }
+        if byteAt(s, i) != ';' {
+            return -1
+        }
+        return i + 1
+    }
+    if !isAlphaByte(byteAt(s, i)) {
+        return -1
+    }
+    var n: i64 = 0
+    while i < s.len && isAlnumByte(s[i]) && n < 33 {
+        n = n + 1
+        i = i + 1
+    }
+    if n < 2 || n > 32 || byteAt(s, i) != ';' {
+        return -1
+    }
+    return i + 1
+}
+
+// ── Escapes, entities and reference labels ───────────────────────────────────
+
+fn hexVal(c: u8): i64 {
+    if c >= '0' && c <= '9' {
+        return (c - '0') as i64
+    }
+    if c >= 'a' && c <= 'f' {
+        return (c - 'a') as i64 + 10
+    }
+    if c >= 'A' && c <= 'F' {
+        return (c - 'A') as i64 + 10
+    }
+    return -1
+}
+
+// Resolve backslash escapes and character references — what a link destination,
+// a title and a code fence's info string all go through before they are stored.
+fn unescapeString(s: &string): string {
+    var out = ""
+    var i: i64 = 0
+    while i < s.len {
+        let c = s[i]
+        if c == '\\' && i + 1 < s.len && isAsciiPunct(s[i + 1]) {
+            out.push(s[i + 1])
+            i = i + 2
+            continue
+        }
+        if c == '&' {
+            let e = scanEntity(s, i)
+            if e > 0 {
+                let raw = s.substr(i, e)
+                let dec = decodeEntityRef(raw)
+                out.pushStr(dec)
+                i = e
+                continue
+            }
+        }
+        out.push(c)
+        i = i + 1
+    }
+    return out
+}
+
+// Decode one `&...;` reference. An unknown name decodes to itself, which is
+// what makes `&MadeUpEntity;` survive into the output as literal text.
+fn decodeEntityRef(raw: &string): string {
+    if raw.len >= 4 && raw[1] == '#' {
+        var value: i64 = 0
+        var i: i64 = 2
+        var radix: i64 = 10
+        if raw[2] == 'x' || raw[2] == 'X' {
+            radix = 16
+            i = 3
+        }
+        while i < raw.len - 1 {
+            let d = hexVal(raw[i])
+            if d < 0 || d >= radix {
+                break
+            }
+            // Saturate: the text is untrusted and anything past the Unicode
+            // range is invalid however far past it goes.
+            if value <= 1114111 {
+                value = value * radix + d
+            }
+            i = i + 1
+        }
+        // NUL, surrogates and out-of-range values all become U+FFFD: emitting
+        // them would produce bytes that are not valid UTF-8, or a NUL that
+        // truncates the string wherever it is next written.
+        if value == 0 || value > 1114111 || (value >= 55296 && value <= 57343) {
+            value = 65533
+        }
+        var out = ""
+        encodeCodepoint(out, value as i32)
+        return out
+    }
+    let name = raw.substr(1, raw.len - 1)
+    let v = namedEntityValue(name)
+    if v.len > 0 {
+        return v
+    }
+    return raw.clone()
+}
+
+fn namedEntityValue(name: &string): string {
+    let key = "\n" + name + " "
+    let data = entityData()
+    match data.indexOf(key) {
+        Option.Some(at) => {
+            var out = ""
+            var i = at + key.len
+            var cp: i64 = 0
+            var have = false
+            while i < data.len {
+                let c = data[i]
+                if c == '\n' {
+                    break
+                }
+                if c == ' ' {
+                    if have {
+                        encodeCodepoint(out, cp as i32)
+                    }
+                    cp = 0
+                    have = false
+                    i = i + 1
+                    continue
+                }
+                cp = cp * 16 + hexVal(c)
+                have = true
+                i = i + 1
+            }
+            if have {
+                encodeCodepoint(out, cp as i32)
+            }
+            return out
+        }
+        Option.None => {
+            return ""
+        }
+    }
+}
+
+// Case-fold one codepoint into `out`. This is the alphabetic core of Unicode
+// case folding — ASCII, Latin-1, Latin Extended-A, Greek and Cyrillic, plus the
+// two sharp s forms that fold to "ss" — not the full case-folding table. A
+// codepoint outside those ranges folds to itself, which for a script without
+// case is the right answer anyway.
+fn foldCaseCp(out: &mut string, cp: i32): void {
+    if cp < 128 {
+        if cp >= 65 && cp <= 90 {
+            out.push((cp + 32) as u8)
+        } else {
+            out.push(cp as u8)
+        }
+        return
+    }
+    // ß and ẞ both fold to "ss", which is why `[ẞ]` and `[SS]` are one label.
+    if cp == 223 || cp == 7838 {
+        out.pushStr("ss")
+        return
+    }
+    var folded = cp
+    if cp >= 192 && cp <= 222 && cp != 215 {
+        folded = cp + 32
+    } else if (cp >= 256 && cp <= 311) || (cp >= 330 && cp <= 375) {
+        if cp % 2 == 0 {
+            folded = cp + 1
+        }
+    } else if (cp >= 313 && cp <= 328) || (cp >= 377 && cp <= 382) {
+        if cp % 2 == 1 {
+            folded = cp + 1
+        }
+    } else if cp >= 913 && cp <= 929 {
+        folded = cp + 32
+    } else if cp >= 931 && cp <= 939 {
+        folded = cp + 32
+    } else if cp >= 1040 && cp <= 1071 {
+        folded = cp + 32
+    } else if cp >= 1024 && cp <= 1039 {
+        folded = cp + 80
+    }
+    encodeCodepoint(out, folded)
+}
+
+// A reference label matches with runs of whitespace collapsed and case folded.
+fn normalizeReference(label: &string): string {
+    if label.len < 2 {
+        return ""
+    }
+    let inner = label.substr(1, label.len - 1)
+    let trimmed = inner.trim()
+    var out = ""
+    var prevSpace = false
+    for cp in trimmed.codePoints() {
+        if cp == 32 || cp == 9 || cp == 10 || cp == 13 {
+            if !prevSpace {
+                out.push(' ')
+                prevSpace = true
+            }
+        } else {
+            foldCaseCp(out, cp)
+            prevSpace = false
+        }
+    }
+    return out
+}
+
+// ── HTML rendering ───────────────────────────────────────────────────────────
+//
+// A fold over the tree, matching cmark's output byte for byte where the spec
+// pins it. `cr` is cmark's newline rule: end the current line if it has any
+// content, which is what keeps block tags on their own lines without emitting
+// blank ones.
+
+fn cr(out: &mut string): void {
+    if out.len > 0 && out[out.len - 1] != '\n' {
+        out.push('\n')
+    }
+}
+
+impl Markdown {
+    // Render the whole document to HTML.
+    fn toHtml(self: &Self): string {
+        var out = ""
+        self.renderChildren(self.root, out, false)
+        return out
+    }
+
+    fn renderChildren(self: &Self, node: i64, out: &mut string, tight: bool): void {
+        var i: i64 = 0
+        let n = self.nodes[node].childCount
+        while i < n {
+            let c = self.childIdx[self.nodes[node].childStart + i]
+            self.renderNode(c, out, tight)
+            i = i + 1
+        }
+    }
+
+    fn renderNode(self: &Self, node: i64, out: &mut string, tight: bool): void {
+        let k = self.nodes[node].kind
+
+        if isKind(k, NodeKind.Document) {
+            self.renderChildren(node, out, false)
+            return
+        }
+        if isKind(k, NodeKind.Paragraph) {
+            if tight {
+                self.renderChildren(node, out, false)
+                return
+            }
+            cr(out)
+            out.pushStr("<p>")
+            self.renderChildren(node, out, false)
+            out.pushStr("</p>\n")
+            return
+        }
+        if isKind(k, NodeKind.Heading) {
+            cr(out)
+            let lvl = self.nodes[node].level
+            out.pushStr("<h")
+            out.push(('0' as i64 + lvl) as u8)
+            out.push('>')
+            self.renderChildren(node, out, false)
+            out.pushStr("</h")
+            out.push(('0' as i64 + lvl) as u8)
+            out.pushStr(">\n")
+            return
+        }
+        if isKind(k, NodeKind.ThematicBreak) {
+            cr(out)
+            out.pushStr("<hr />\n")
+            return
+        }
+        if isKind(k, NodeKind.BlockQuote) {
+            cr(out)
+            out.pushStr("<blockquote>\n")
+            self.renderChildren(node, out, false)
+            cr(out)
+            out.pushStr("</blockquote>\n")
+            return
+        }
+        if isKind(k, NodeKind.List) {
+            cr(out)
+            let isTight = self.nodes[node].listTight
+            if self.nodes[node].listOrdered {
+                out.pushStr("<ol")
+                let start = self.nodes[node].level
+                if start != 1 {
+                    out.pushStr(" start=\"")
+                    out.pushStr(i64ToStr(start))
+                    out.push('"')
+                }
+                out.pushStr(">\n")
+                self.renderChildren(node, out, isTight)
+                cr(out)
+                out.pushStr("</ol>\n")
+            } else {
+                out.pushStr("<ul>\n")
+                self.renderChildren(node, out, isTight)
+                cr(out)
+                out.pushStr("</ul>\n")
+            }
+            return
+        }
+        if isKind(k, NodeKind.Item) {
+            cr(out)
+            out.pushStr("<li>")
+            if self.nodes[node].taskState != 0 {
+                // GFM renders the checkbox as a disabled input before the
+                // item's content.
+                if self.nodes[node].taskState == 2 {
+                    out.pushStr("<input type=\"checkbox\" checked=\"\" disabled=\"\" /> ")
+                } else {
+                    out.pushStr("<input type=\"checkbox\" disabled=\"\" /> ")
+                }
+            }
+            self.renderChildren(node, out, tight)
+            out.pushStr("</li>\n")
+            return
+        }
+        if isKind(k, NodeKind.CodeBlock) {
+            cr(out)
+            out.pushStr("<pre><code")
+            let info = self.nodes[node].dest.clone()
+            if info.len > 0 {
+                // Only the first word of the info string becomes the class.
+                var end: i64 = 0
+                while end < info.len && info[end] != ' ' && info[end] != '\t' {
+                    end = end + 1
+                }
+                let lang = info.substr(0, end)
+                out.pushStr(" class=\"language-")
+                escapeHtmlInto(lang, out)
+                out.push('"')
+            }
+            out.push('>')
+            escapeHtmlInto(self.nodes[node].literal, out)
+            out.pushStr("</code></pre>\n")
+            return
+        }
+        if isKind(k, NodeKind.HtmlBlock) {
+            cr(out)
+            out.pushStr(self.nodes[node].literal)
+            cr(out)
+            return
+        }
+        if isKind(k, NodeKind.Text) {
+            escapeHtmlInto(self.nodes[node].literal, out)
+            return
+        }
+        if isKind(k, NodeKind.SoftBreak) {
+            out.push('\n')
+            return
+        }
+        if isKind(k, NodeKind.LineBreak) {
+            out.pushStr("<br />\n")
+            return
+        }
+        if isKind(k, NodeKind.Code) {
+            out.pushStr("<code>")
+            escapeHtmlInto(self.nodes[node].literal, out)
+            out.pushStr("</code>")
+            return
+        }
+        if isKind(k, NodeKind.HtmlInline) {
+            out.pushStr(self.nodes[node].literal)
+            return
+        }
+        if isKind(k, NodeKind.Emph) {
+            out.pushStr("<em>")
+            self.renderChildren(node, out, false)
+            out.pushStr("</em>")
+            return
+        }
+        if isKind(k, NodeKind.Strong) {
+            out.pushStr("<strong>")
+            self.renderChildren(node, out, false)
+            out.pushStr("</strong>")
+            return
+        }
+        if isKind(k, NodeKind.Strike) {
+            out.pushStr("<del>")
+            self.renderChildren(node, out, false)
+            out.pushStr("</del>")
+            return
+        }
+        if isKind(k, NodeKind.Link) {
+            out.pushStr("<a href=\"")
+            escapeHref(self.nodes[node].dest, out)
+            out.push('"')
+            if self.nodes[node].title.len > 0 {
+                out.pushStr(" title=\"")
+                escapeHtmlInto(self.nodes[node].title, out)
+                out.push('"')
+            }
+            out.push('>')
+            self.renderChildren(node, out, false)
+            out.pushStr("</a>")
+            return
+        }
+        if isKind(k, NodeKind.Image) {
+            out.pushStr("<img src=\"")
+            escapeHref(self.nodes[node].dest, out)
+            out.pushStr("\" alt=\"")
+            let alt = self.innerText(node)
+            escapeHtmlInto(alt, out)
+            out.push('"')
+            if self.nodes[node].title.len > 0 {
+                out.pushStr(" title=\"")
+                escapeHtmlInto(self.nodes[node].title, out)
+                out.push('"')
+            }
+            out.pushStr(" />")
+            return
+        }
+        if isKind(k, NodeKind.Table) {
+            cr(out)
+            out.pushStr("<table>\n")
+            let n = self.nodes[node].childCount
+            var i: i64 = 0
+            var inBody = false
+            while i < n {
+                let row = self.childIdx[self.nodes[node].childStart + i]
+                if self.nodes[row].isHeader {
+                    out.pushStr("<thead>\n")
+                    self.renderNode(row, out, false)
+                    out.pushStr("</thead>\n")
+                } else {
+                    if !inBody {
+                        out.pushStr("<tbody>\n")
+                        inBody = true
+                    }
+                    self.renderNode(row, out, false)
+                }
+                i = i + 1
+            }
+            if inBody {
+                out.pushStr("</tbody>\n")
+            }
+            out.pushStr("</table>\n")
+            return
+        }
+        if isKind(k, NodeKind.TableRow) {
+            out.pushStr("<tr>\n")
+            self.renderChildren(node, out, false)
+            out.pushStr("</tr>\n")
+            return
+        }
+        if isKind(k, NodeKind.TableCell) {
+            var tag = "td"
+            if self.nodes[node].isHeader {
+                tag = "th"
+            }
+            out.push('<')
+            out.pushStr(tag)
+            let a = self.nodes[node].level
+            if a == 1 {
+                out.pushStr(" align=\"left\"")
+            } else if a == 2 {
+                out.pushStr(" align=\"center\"")
+            } else if a == 3 {
+                out.pushStr(" align=\"right\"")
+            }
+            out.push('>')
+            self.renderChildren(node, out, false)
+            out.pushStr("</")
+            out.pushStr(tag)
+            out.pushStr(">\n")
+            return
+        }
+    }
+}
+
+fn i64ToStr(v: i64): string {
+    if v == 0 {
+        return "0"
+    }
+    var n = v
+    var neg = false
+    if n < 0 {
+        neg = true
+        n = -n
+    }
+    var digits = ""
+    while n > 0 {
+        digits.push(('0' as i64 + (n % 10)) as u8)
+        n = n / 10
+    }
+    var out = ""
+    if neg {
+        out.push('-')
+    }
+    var i = digits.len
+    while i > 0 {
+        out.push(digits[i - 1])
+        i = i - 1
+    }
+    return out
+}
+
+// The HTML5 named character reference table, as `name cp[ cp]` records: the
+// spec requires every one of these to be recognised in `&name;` form. It is
+// stored as text and parsed into a map on first use, so a document with no
+// entity references never pays for it.
+fn entityData(): string {
+    var s = "\n"
+    s.pushStr("AElig C6\nAMP 26\nAacute C1\nAbreve 102\nAcirc C2\nAcy 410\nAfr 1D504\nAgrave C0\nAlpha 391\n")
+    s.pushStr("Amacr 100\nAnd 2A53\nAogon 104\nAopf 1D538\nApplyFunction 2061\nAring C5\nAscr 1D49C\n")
+    s.pushStr("Assign 2254\nAtilde C3\nAuml C4\nBackslash 2216\nBarv 2AE7\nBarwed 2306\nBcy 411\nBecause 2235\n")
+    s.pushStr("Bernoullis 212C\nBeta 392\nBfr 1D505\nBopf 1D539\nBreve 2D8\nBscr 212C\nBumpeq 224E\nCHcy 427\n")
+    s.pushStr("COPY A9\nCacute 106\nCap 22D2\nCapitalDifferentialD 2145\nCayleys 212D\nCcaron 10C\nCcedil C7\n")
+    s.pushStr("Ccirc 108\nCconint 2230\nCdot 10A\nCedilla B8\nCenterDot B7\nCfr 212D\nChi 3A7\nCircleDot 2299\n")
+    s.pushStr("CircleMinus 2296\nCirclePlus 2295\nCircleTimes 2297\nClockwiseContourIntegral 2232\n")
+    s.pushStr("CloseCurlyDoubleQuote 201D\nCloseCurlyQuote 2019\nColon 2237\nColone 2A74\nCongruent 2261\n")
+    s.pushStr("Conint 222F\nContourIntegral 222E\nCopf 2102\nCoproduct 2210\n")
+    s.pushStr("CounterClockwiseContourIntegral 2233\nCross 2A2F\nCscr 1D49E\nCup 22D3\nCupCap 224D\nDD 2145\n")
+    s.pushStr("DDotrahd 2911\nDJcy 402\nDScy 405\nDZcy 40F\nDagger 2021\nDarr 21A1\nDashv 2AE4\nDcaron 10E\n")
+    s.pushStr("Dcy 414\nDel 2207\nDelta 394\nDfr 1D507\nDiacriticalAcute B4\nDiacriticalDot 2D9\n")
+    s.pushStr("DiacriticalDoubleAcute 2DD\nDiacriticalGrave 60\nDiacriticalTilde 2DC\nDiamond 22C4\n")
+    s.pushStr("DifferentialD 2146\nDopf 1D53B\nDot A8\nDotDot 20DC\nDotEqual 2250\n")
+    s.pushStr("DoubleContourIntegral 222F\nDoubleDot A8\nDoubleDownArrow 21D3\nDoubleLeftArrow 21D0\n")
+    s.pushStr("DoubleLeftRightArrow 21D4\nDoubleLeftTee 2AE4\nDoubleLongLeftArrow 27F8\n")
+    s.pushStr("DoubleLongLeftRightArrow 27FA\nDoubleLongRightArrow 27F9\nDoubleRightArrow 21D2\n")
+    s.pushStr("DoubleRightTee 22A8\nDoubleUpArrow 21D1\nDoubleUpDownArrow 21D5\nDoubleVerticalBar 2225\n")
+    s.pushStr("DownArrow 2193\nDownArrowBar 2913\nDownArrowUpArrow 21F5\nDownBreve 311\n")
+    s.pushStr("DownLeftRightVector 2950\nDownLeftTeeVector 295E\nDownLeftVector 21BD\n")
+    s.pushStr("DownLeftVectorBar 2956\nDownRightTeeVector 295F\nDownRightVector 21C1\n")
+    s.pushStr("DownRightVectorBar 2957\nDownTee 22A4\nDownTeeArrow 21A7\nDownarrow 21D3\nDscr 1D49F\n")
+    s.pushStr("Dstrok 110\nENG 14A\nETH D0\nEacute C9\nEcaron 11A\nEcirc CA\nEcy 42D\nEdot 116\nEfr 1D508\n")
+    s.pushStr("Egrave C8\nElement 2208\nEmacr 112\nEmptySmallSquare 25FB\nEmptyVerySmallSquare 25AB\n")
+    s.pushStr("Eogon 118\nEopf 1D53C\nEpsilon 395\nEqual 2A75\nEqualTilde 2242\nEquilibrium 21CC\nEscr 2130\n")
+    s.pushStr("Esim 2A73\nEta 397\nEuml CB\nExists 2203\nExponentialE 2147\nFcy 424\nFfr 1D509\n")
+    s.pushStr("FilledSmallSquare 25FC\nFilledVerySmallSquare 25AA\nFopf 1D53D\nForAll 2200\n")
+    s.pushStr("Fouriertrf 2131\nFscr 2131\nGJcy 403\nGT 3E\nGamma 393\nGammad 3DC\nGbreve 11E\nGcedil 122\n")
+    s.pushStr("Gcirc 11C\nGcy 413\nGdot 120\nGfr 1D50A\nGg 22D9\nGopf 1D53E\nGreaterEqual 2265\n")
+    s.pushStr("GreaterEqualLess 22DB\nGreaterFullEqual 2267\nGreaterGreater 2AA2\nGreaterLess 2277\n")
+    s.pushStr("GreaterSlantEqual 2A7E\nGreaterTilde 2273\nGscr 1D4A2\nGt 226B\nHARDcy 42A\nHacek 2C7\nHat 5E\n")
+    s.pushStr("Hcirc 124\nHfr 210C\nHilbertSpace 210B\nHopf 210D\nHorizontalLine 2500\nHscr 210B\nHstrok 126\n")
+    s.pushStr("HumpDownHump 224E\nHumpEqual 224F\nIEcy 415\nIJlig 132\nIOcy 401\nIacute CD\nIcirc CE\nIcy 418\n")
+    s.pushStr("Idot 130\nIfr 2111\nIgrave CC\nIm 2111\nImacr 12A\nImaginaryI 2148\nImplies 21D2\nInt 222C\n")
+    s.pushStr("Integral 222B\nIntersection 22C2\nInvisibleComma 2063\nInvisibleTimes 2062\nIogon 12E\n")
+    s.pushStr("Iopf 1D540\nIota 399\nIscr 2110\nItilde 128\nIukcy 406\nIuml CF\nJcirc 134\nJcy 419\nJfr 1D50D\n")
+    s.pushStr("Jopf 1D541\nJscr 1D4A5\nJsercy 408\nJukcy 404\nKHcy 425\nKJcy 40C\nKappa 39A\nKcedil 136\n")
+    s.pushStr("Kcy 41A\nKfr 1D50E\nKopf 1D542\nKscr 1D4A6\nLJcy 409\nLT 3C\nLacute 139\nLambda 39B\nLang 27EA\n")
+    s.pushStr("Laplacetrf 2112\nLarr 219E\nLcaron 13D\nLcedil 13B\nLcy 41B\nLeftAngleBracket 27E8\n")
+    s.pushStr("LeftArrow 2190\nLeftArrowBar 21E4\nLeftArrowRightArrow 21C6\nLeftCeiling 2308\n")
+    s.pushStr("LeftDoubleBracket 27E6\nLeftDownTeeVector 2961\nLeftDownVector 21C3\n")
+    s.pushStr("LeftDownVectorBar 2959\nLeftFloor 230A\nLeftRightArrow 2194\nLeftRightVector 294E\n")
+    s.pushStr("LeftTee 22A3\nLeftTeeArrow 21A4\nLeftTeeVector 295A\nLeftTriangle 22B2\n")
+    s.pushStr("LeftTriangleBar 29CF\nLeftTriangleEqual 22B4\nLeftUpDownVector 2951\nLeftUpTeeVector 2960\n")
+    s.pushStr("LeftUpVector 21BF\nLeftUpVectorBar 2958\nLeftVector 21BC\nLeftVectorBar 2952\n")
+    s.pushStr("Leftarrow 21D0\nLeftrightarrow 21D4\nLessEqualGreater 22DA\nLessFullEqual 2266\n")
+    s.pushStr("LessGreater 2276\nLessLess 2AA1\nLessSlantEqual 2A7D\nLessTilde 2272\nLfr 1D50F\nLl 22D8\n")
+    s.pushStr("Lleftarrow 21DA\nLmidot 13F\nLongLeftArrow 27F5\nLongLeftRightArrow 27F7\n")
+    s.pushStr("LongRightArrow 27F6\nLongleftarrow 27F8\nLongleftrightarrow 27FA\nLongrightarrow 27F9\n")
+    s.pushStr("Lopf 1D543\nLowerLeftArrow 2199\nLowerRightArrow 2198\nLscr 2112\nLsh 21B0\nLstrok 141\n")
+    s.pushStr("Lt 226A\nMap 2905\nMcy 41C\nMediumSpace 205F\nMellintrf 2133\nMfr 1D510\nMinusPlus 2213\n")
+    s.pushStr("Mopf 1D544\nMscr 2133\nMu 39C\nNJcy 40A\nNacute 143\nNcaron 147\nNcedil 145\nNcy 41D\n")
+    s.pushStr("NegativeMediumSpace 200B\nNegativeThickSpace 200B\nNegativeThinSpace 200B\n")
+    s.pushStr("NegativeVeryThinSpace 200B\nNestedGreaterGreater 226B\nNestedLessLess 226A\nNewLine A\n")
+    s.pushStr("Nfr 1D511\nNoBreak 2060\nNonBreakingSpace A0\nNopf 2115\nNot 2AEC\nNotCongruent 2262\n")
+    s.pushStr("NotCupCap 226D\nNotDoubleVerticalBar 2226\nNotElement 2209\nNotEqual 2260\n")
+    s.pushStr("NotEqualTilde 2242 338\nNotExists 2204\nNotGreater 226F\nNotGreaterEqual 2271\n")
+    s.pushStr("NotGreaterFullEqual 2267 338\nNotGreaterGreater 226B 338\nNotGreaterLess 2279\n")
+    s.pushStr("NotGreaterSlantEqual 2A7E 338\nNotGreaterTilde 2275\nNotHumpDownHump 224E 338\n")
+    s.pushStr("NotHumpEqual 224F 338\nNotLeftTriangle 22EA\nNotLeftTriangleBar 29CF 338\n")
+    s.pushStr("NotLeftTriangleEqual 22EC\nNotLess 226E\nNotLessEqual 2270\nNotLessGreater 2278\n")
+    s.pushStr("NotLessLess 226A 338\nNotLessSlantEqual 2A7D 338\nNotLessTilde 2274\n")
+    s.pushStr("NotNestedGreaterGreater 2AA2 338\nNotNestedLessLess 2AA1 338\nNotPrecedes 2280\n")
+    s.pushStr("NotPrecedesEqual 2AAF 338\nNotPrecedesSlantEqual 22E0\nNotReverseElement 220C\n")
+    s.pushStr("NotRightTriangle 22EB\nNotRightTriangleBar 29D0 338\nNotRightTriangleEqual 22ED\n")
+    s.pushStr("NotSquareSubset 228F 338\nNotSquareSubsetEqual 22E2\nNotSquareSuperset 2290 338\n")
+    s.pushStr("NotSquareSupersetEqual 22E3\nNotSubset 2282 20D2\nNotSubsetEqual 2288\nNotSucceeds 2281\n")
+    s.pushStr("NotSucceedsEqual 2AB0 338\nNotSucceedsSlantEqual 22E1\nNotSucceedsTilde 227F 338\n")
+    s.pushStr("NotSuperset 2283 20D2\nNotSupersetEqual 2289\nNotTilde 2241\nNotTildeEqual 2244\n")
+    s.pushStr("NotTildeFullEqual 2247\nNotTildeTilde 2249\nNotVerticalBar 2224\nNscr 1D4A9\nNtilde D1\n")
+    s.pushStr("Nu 39D\nOElig 152\nOacute D3\nOcirc D4\nOcy 41E\nOdblac 150\nOfr 1D512\nOgrave D2\nOmacr 14C\n")
+    s.pushStr("Omega 3A9\nOmicron 39F\nOopf 1D546\nOpenCurlyDoubleQuote 201C\nOpenCurlyQuote 2018\nOr 2A54\n")
+    s.pushStr("Oscr 1D4AA\nOslash D8\nOtilde D5\nOtimes 2A37\nOuml D6\nOverBar 203E\nOverBrace 23DE\n")
+    s.pushStr("OverBracket 23B4\nOverParenthesis 23DC\nPartialD 2202\nPcy 41F\nPfr 1D513\nPhi 3A6\nPi 3A0\n")
+    s.pushStr("PlusMinus B1\nPoincareplane 210C\nPopf 2119\nPr 2ABB\nPrecedes 227A\nPrecedesEqual 2AAF\n")
+    s.pushStr("PrecedesSlantEqual 227C\nPrecedesTilde 227E\nPrime 2033\nProduct 220F\nProportion 2237\n")
+    s.pushStr("Proportional 221D\nPscr 1D4AB\nPsi 3A8\nQUOT 22\nQfr 1D514\nQopf 211A\nQscr 1D4AC\nRBarr 2910\n")
+    s.pushStr("REG AE\nRacute 154\nRang 27EB\nRarr 21A0\nRarrtl 2916\nRcaron 158\nRcedil 156\nRcy 420\nRe 211C\n")
+    s.pushStr("ReverseElement 220B\nReverseEquilibrium 21CB\nReverseUpEquilibrium 296F\nRfr 211C\nRho 3A1\n")
+    s.pushStr("RightAngleBracket 27E9\nRightArrow 2192\nRightArrowBar 21E5\nRightArrowLeftArrow 21C4\n")
+    s.pushStr("RightCeiling 2309\nRightDoubleBracket 27E7\nRightDownTeeVector 295D\nRightDownVector 21C2\n")
+    s.pushStr("RightDownVectorBar 2955\nRightFloor 230B\nRightTee 22A2\nRightTeeArrow 21A6\n")
+    s.pushStr("RightTeeVector 295B\nRightTriangle 22B3\nRightTriangleBar 29D0\nRightTriangleEqual 22B5\n")
+    s.pushStr("RightUpDownVector 294F\nRightUpTeeVector 295C\nRightUpVector 21BE\nRightUpVectorBar 2954\n")
+    s.pushStr("RightVector 21C0\nRightVectorBar 2953\nRightarrow 21D2\nRopf 211D\nRoundImplies 2970\n")
+    s.pushStr("Rrightarrow 21DB\nRscr 211B\nRsh 21B1\nRuleDelayed 29F4\nSHCHcy 429\nSHcy 428\nSOFTcy 42C\n")
+    s.pushStr("Sacute 15A\nSc 2ABC\nScaron 160\nScedil 15E\nScirc 15C\nScy 421\nSfr 1D516\n")
+    s.pushStr("ShortDownArrow 2193\nShortLeftArrow 2190\nShortRightArrow 2192\nShortUpArrow 2191\n")
+    s.pushStr("Sigma 3A3\nSmallCircle 2218\nSopf 1D54A\nSqrt 221A\nSquare 25A1\nSquareIntersection 2293\n")
+    s.pushStr("SquareSubset 228F\nSquareSubsetEqual 2291\nSquareSuperset 2290\nSquareSupersetEqual 2292\n")
+    s.pushStr("SquareUnion 2294\nSscr 1D4AE\nStar 22C6\nSub 22D0\nSubset 22D0\nSubsetEqual 2286\n")
+    s.pushStr("Succeeds 227B\nSucceedsEqual 2AB0\nSucceedsSlantEqual 227D\nSucceedsTilde 227F\n")
+    s.pushStr("SuchThat 220B\nSum 2211\nSup 22D1\nSuperset 2283\nSupersetEqual 2287\nSupset 22D1\nTHORN DE\n")
+    s.pushStr("TRADE 2122\nTSHcy 40B\nTScy 426\nTab 9\nTau 3A4\nTcaron 164\nTcedil 162\nTcy 422\nTfr 1D517\n")
+    s.pushStr("Therefore 2234\nTheta 398\nThickSpace 205F 200A\nThinSpace 2009\nTilde 223C\nTildeEqual 2243\n")
+    s.pushStr("TildeFullEqual 2245\nTildeTilde 2248\nTopf 1D54B\nTripleDot 20DB\nTscr 1D4AF\nTstrok 166\n")
+    s.pushStr("Uacute DA\nUarr 219F\nUarrocir 2949\nUbrcy 40E\nUbreve 16C\nUcirc DB\nUcy 423\nUdblac 170\n")
+    s.pushStr("Ufr 1D518\nUgrave D9\nUmacr 16A\nUnderBar 5F\nUnderBrace 23DF\nUnderBracket 23B5\n")
+    s.pushStr("UnderParenthesis 23DD\nUnion 22C3\nUnionPlus 228E\nUogon 172\nUopf 1D54C\nUpArrow 2191\n")
+    s.pushStr("UpArrowBar 2912\nUpArrowDownArrow 21C5\nUpDownArrow 2195\nUpEquilibrium 296E\nUpTee 22A5\n")
+    s.pushStr("UpTeeArrow 21A5\nUparrow 21D1\nUpdownarrow 21D5\nUpperLeftArrow 2196\nUpperRightArrow 2197\n")
+    s.pushStr("Upsi 3D2\nUpsilon 3A5\nUring 16E\nUscr 1D4B0\nUtilde 168\nUuml DC\nVDash 22AB\nVbar 2AEB\n")
+    s.pushStr("Vcy 412\nVdash 22A9\nVdashl 2AE6\nVee 22C1\nVerbar 2016\nVert 2016\nVerticalBar 2223\n")
+    s.pushStr("VerticalLine 7C\nVerticalSeparator 2758\nVerticalTilde 2240\nVeryThinSpace 200A\nVfr 1D519\n")
+    s.pushStr("Vopf 1D54D\nVscr 1D4B1\nVvdash 22AA\nWcirc 174\nWedge 22C0\nWfr 1D51A\nWopf 1D54E\nWscr 1D4B2\n")
+    s.pushStr("Xfr 1D51B\nXi 39E\nXopf 1D54F\nXscr 1D4B3\nYAcy 42F\nYIcy 407\nYUcy 42E\nYacute DD\nYcirc 176\n")
+    s.pushStr("Ycy 42B\nYfr 1D51C\nYopf 1D550\nYscr 1D4B4\nYuml 178\nZHcy 416\nZacute 179\nZcaron 17D\nZcy 417\n")
+    s.pushStr("Zdot 17B\nZeroWidthSpace 200B\nZeta 396\nZfr 2128\nZopf 2124\nZscr 1D4B5\naacute E1\n")
+    s.pushStr("abreve 103\nac 223E\nacE 223E 333\nacd 223F\nacirc E2\nacute B4\nacy 430\naelig E6\naf 2061\n")
+    s.pushStr("afr 1D51E\nagrave E0\nalefsym 2135\naleph 2135\nalpha 3B1\namacr 101\namalg 2A3F\namp 26\n")
+    s.pushStr("and 2227\nandand 2A55\nandd 2A5C\nandslope 2A58\nandv 2A5A\nang 2220\nange 29A4\nangle 2220\n")
+    s.pushStr("angmsd 2221\nangmsdaa 29A8\nangmsdab 29A9\nangmsdac 29AA\nangmsdad 29AB\nangmsdae 29AC\n")
+    s.pushStr("angmsdaf 29AD\nangmsdag 29AE\nangmsdah 29AF\nangrt 221F\nangrtvb 22BE\nangrtvbd 299D\n")
+    s.pushStr("angsph 2222\nangst C5\nangzarr 237C\naogon 105\naopf 1D552\nap 2248\napE 2A70\napacir 2A6F\n")
+    s.pushStr("ape 224A\napid 224B\napos 27\napprox 2248\napproxeq 224A\naring E5\nascr 1D4B6\nast 2A\n")
+    s.pushStr("asymp 2248\nasympeq 224D\natilde E3\nauml E4\nawconint 2233\nawint 2A11\nbNot 2AED\n")
+    s.pushStr("backcong 224C\nbackepsilon 3F6\nbackprime 2035\nbacksim 223D\nbacksimeq 22CD\nbarvee 22BD\n")
+    s.pushStr("barwed 2305\nbarwedge 2305\nbbrk 23B5\nbbrktbrk 23B6\nbcong 224C\nbcy 431\nbdquo 201E\n")
+    s.pushStr("becaus 2235\nbecause 2235\nbemptyv 29B0\nbepsi 3F6\nbernou 212C\nbeta 3B2\nbeth 2136\n")
+    s.pushStr("between 226C\nbfr 1D51F\nbigcap 22C2\nbigcirc 25EF\nbigcup 22C3\nbigodot 2A00\nbigoplus 2A01\n")
+    s.pushStr("bigotimes 2A02\nbigsqcup 2A06\nbigstar 2605\nbigtriangledown 25BD\nbigtriangleup 25B3\n")
+    s.pushStr("biguplus 2A04\nbigvee 22C1\nbigwedge 22C0\nbkarow 290D\nblacklozenge 29EB\nblacksquare 25AA\n")
+    s.pushStr("blacktriangle 25B4\nblacktriangledown 25BE\nblacktriangleleft 25C2\n")
+    s.pushStr("blacktriangleright 25B8\nblank 2423\nblk12 2592\nblk14 2591\nblk34 2593\nblock 2588\n")
+    s.pushStr("bne 3D 20E5\nbnequiv 2261 20E5\nbnot 2310\nbopf 1D553\nbot 22A5\nbottom 22A5\nbowtie 22C8\n")
+    s.pushStr("boxDL 2557\nboxDR 2554\nboxDl 2556\nboxDr 2553\nboxH 2550\nboxHD 2566\nboxHU 2569\nboxHd 2564\n")
+    s.pushStr("boxHu 2567\nboxUL 255D\nboxUR 255A\nboxUl 255C\nboxUr 2559\nboxV 2551\nboxVH 256C\nboxVL 2563\n")
+    s.pushStr("boxVR 2560\nboxVh 256B\nboxVl 2562\nboxVr 255F\nboxbox 29C9\nboxdL 2555\nboxdR 2552\n")
+    s.pushStr("boxdl 2510\nboxdr 250C\nboxh 2500\nboxhD 2565\nboxhU 2568\nboxhd 252C\nboxhu 2534\n")
+    s.pushStr("boxminus 229F\nboxplus 229E\nboxtimes 22A0\nboxuL 255B\nboxuR 2558\nboxul 2518\nboxur 2514\n")
+    s.pushStr("boxv 2502\nboxvH 256A\nboxvL 2561\nboxvR 255E\nboxvh 253C\nboxvl 2524\nboxvr 251C\nbprime 2035\n")
+    s.pushStr("breve 2D8\nbrvbar A6\nbscr 1D4B7\nbsemi 204F\nbsim 223D\nbsime 22CD\nbsol 5C\nbsolb 29C5\n")
+    s.pushStr("bsolhsub 27C8\nbull 2022\nbullet 2022\nbump 224E\nbumpE 2AAE\nbumpe 224F\nbumpeq 224F\n")
+    s.pushStr("cacute 107\ncap 2229\ncapand 2A44\ncapbrcup 2A49\ncapcap 2A4B\ncapcup 2A47\ncapdot 2A40\n")
+    s.pushStr("caps 2229 FE00\ncaret 2041\ncaron 2C7\nccaps 2A4D\nccaron 10D\nccedil E7\nccirc 109\n")
+    s.pushStr("ccups 2A4C\nccupssm 2A50\ncdot 10B\ncedil B8\ncemptyv 29B2\ncent A2\ncenterdot B7\ncfr 1D520\n")
+    s.pushStr("chcy 447\ncheck 2713\ncheckmark 2713\nchi 3C7\ncir 25CB\ncirE 29C3\ncirc 2C6\ncirceq 2257\n")
+    s.pushStr("circlearrowleft 21BA\ncirclearrowright 21BB\ncircledR AE\ncircledS 24C8\ncircledast 229B\n")
+    s.pushStr("circledcirc 229A\ncircleddash 229D\ncire 2257\ncirfnint 2A10\ncirmid 2AEF\ncirscir 29C2\n")
+    s.pushStr("clubs 2663\nclubsuit 2663\ncolon 3A\ncolone 2254\ncoloneq 2254\ncomma 2C\ncommat 40\ncomp 2201\n")
+    s.pushStr("compfn 2218\ncomplement 2201\ncomplexes 2102\ncong 2245\ncongdot 2A6D\nconint 222E\n")
+    s.pushStr("copf 1D554\ncoprod 2210\ncopy A9\ncopysr 2117\ncrarr 21B5\ncross 2717\ncscr 1D4B8\ncsub 2ACF\n")
+    s.pushStr("csube 2AD1\ncsup 2AD0\ncsupe 2AD2\nctdot 22EF\ncudarrl 2938\ncudarrr 2935\ncuepr 22DE\n")
+    s.pushStr("cuesc 22DF\ncularr 21B6\ncularrp 293D\ncup 222A\ncupbrcap 2A48\ncupcap 2A46\ncupcup 2A4A\n")
+    s.pushStr("cupdot 228D\ncupor 2A45\ncups 222A FE00\ncurarr 21B7\ncurarrm 293C\ncurlyeqprec 22DE\n")
+    s.pushStr("curlyeqsucc 22DF\ncurlyvee 22CE\ncurlywedge 22CF\ncurren A4\ncurvearrowleft 21B6\n")
+    s.pushStr("curvearrowright 21B7\ncuvee 22CE\ncuwed 22CF\ncwconint 2232\ncwint 2231\ncylcty 232D\n")
+    s.pushStr("dArr 21D3\ndHar 2965\ndagger 2020\ndaleth 2138\ndarr 2193\ndash 2010\ndashv 22A3\ndbkarow 290F\n")
+    s.pushStr("dblac 2DD\ndcaron 10F\ndcy 434\ndd 2146\nddagger 2021\nddarr 21CA\nddotseq 2A77\ndeg B0\n")
+    s.pushStr("delta 3B4\ndemptyv 29B1\ndfisht 297F\ndfr 1D521\ndharl 21C3\ndharr 21C2\ndiam 22C4\n")
+    s.pushStr("diamond 22C4\ndiamondsuit 2666\ndiams 2666\ndie A8\ndigamma 3DD\ndisin 22F2\ndiv F7\ndivide F7\n")
+    s.pushStr("divideontimes 22C7\ndivonx 22C7\ndjcy 452\ndlcorn 231E\ndlcrop 230D\ndollar 24\ndopf 1D555\n")
+    s.pushStr("dot 2D9\ndoteq 2250\ndoteqdot 2251\ndotminus 2238\ndotplus 2214\ndotsquare 22A1\n")
+    s.pushStr("doublebarwedge 2306\ndownarrow 2193\ndowndownarrows 21CA\ndownharpoonleft 21C3\n")
+    s.pushStr("downharpoonright 21C2\ndrbkarow 2910\ndrcorn 231F\ndrcrop 230C\ndscr 1D4B9\ndscy 455\n")
+    s.pushStr("dsol 29F6\ndstrok 111\ndtdot 22F1\ndtri 25BF\ndtrif 25BE\nduarr 21F5\nduhar 296F\ndwangle 29A6\n")
+    s.pushStr("dzcy 45F\ndzigrarr 27FF\neDDot 2A77\neDot 2251\neacute E9\neaster 2A6E\necaron 11B\necir 2256\n")
+    s.pushStr("ecirc EA\necolon 2255\necy 44D\nedot 117\nee 2147\nefDot 2252\nefr 1D522\neg 2A9A\negrave E8\n")
+    s.pushStr("egs 2A96\negsdot 2A98\nel 2A99\nelinters 23E7\nell 2113\nels 2A95\nelsdot 2A97\nemacr 113\n")
+    s.pushStr("empty 2205\nemptyset 2205\nemptyv 2205\nemsp 2003\nemsp13 2004\nemsp14 2005\neng 14B\n")
+    s.pushStr("ensp 2002\neogon 119\neopf 1D556\nepar 22D5\neparsl 29E3\neplus 2A71\nepsi 3B5\nepsilon 3B5\n")
+    s.pushStr("epsiv 3F5\neqcirc 2256\neqcolon 2255\neqsim 2242\neqslantgtr 2A96\neqslantless 2A95\n")
+    s.pushStr("equals 3D\nequest 225F\nequiv 2261\nequivDD 2A78\neqvparsl 29E5\nerDot 2253\nerarr 2971\n")
+    s.pushStr("escr 212F\nesdot 2250\nesim 2242\neta 3B7\neth F0\neuml EB\neuro 20AC\nexcl 21\nexist 2203\n")
+    s.pushStr("expectation 2130\nexponentiale 2147\nfallingdotseq 2252\nfcy 444\nfemale 2640\nffilig FB03\n")
+    s.pushStr("fflig FB00\nffllig FB04\nffr 1D523\nfilig FB01\nfjlig 66 6A\nflat 266D\nfllig FB02\nfltns 25B1\n")
+    s.pushStr("fnof 192\nfopf 1D557\nforall 2200\nfork 22D4\nforkv 2AD9\nfpartint 2A0D\nfrac12 BD\n")
+    s.pushStr("frac13 2153\nfrac14 BC\nfrac15 2155\nfrac16 2159\nfrac18 215B\nfrac23 2154\nfrac25 2156\n")
+    s.pushStr("frac34 BE\nfrac35 2157\nfrac38 215C\nfrac45 2158\nfrac56 215A\nfrac58 215D\nfrac78 215E\n")
+    s.pushStr("frasl 2044\nfrown 2322\nfscr 1D4BB\ngE 2267\ngEl 2A8C\ngacute 1F5\ngamma 3B3\ngammad 3DD\n")
+    s.pushStr("gap 2A86\ngbreve 11F\ngcirc 11D\ngcy 433\ngdot 121\nge 2265\ngel 22DB\ngeq 2265\ngeqq 2267\n")
+    s.pushStr("geqslant 2A7E\nges 2A7E\ngescc 2AA9\ngesdot 2A80\ngesdoto 2A82\ngesdotol 2A84\ngesl 22DB FE00\n")
+    s.pushStr("gesles 2A94\ngfr 1D524\ngg 226B\nggg 22D9\ngimel 2137\ngjcy 453\ngl 2277\nglE 2A92\ngla 2AA5\n")
+    s.pushStr("glj 2AA4\ngnE 2269\ngnap 2A8A\ngnapprox 2A8A\ngne 2A88\ngneq 2A88\ngneqq 2269\ngnsim 22E7\n")
+    s.pushStr("gopf 1D558\ngrave 60\ngscr 210A\ngsim 2273\ngsime 2A8E\ngsiml 2A90\ngt 3E\ngtcc 2AA7\n")
+    s.pushStr("gtcir 2A7A\ngtdot 22D7\ngtlPar 2995\ngtquest 2A7C\ngtrapprox 2A86\ngtrarr 2978\ngtrdot 22D7\n")
+    s.pushStr("gtreqless 22DB\ngtreqqless 2A8C\ngtrless 2277\ngtrsim 2273\ngvertneqq 2269 FE00\n")
+    s.pushStr("gvnE 2269 FE00\nhArr 21D4\nhairsp 200A\nhalf BD\nhamilt 210B\nhardcy 44A\nharr 2194\n")
+    s.pushStr("harrcir 2948\nharrw 21AD\nhbar 210F\nhcirc 125\nhearts 2665\nheartsuit 2665\nhellip 2026\n")
+    s.pushStr("hercon 22B9\nhfr 1D525\nhksearow 2925\nhkswarow 2926\nhoarr 21FF\nhomtht 223B\n")
+    s.pushStr("hookleftarrow 21A9\nhookrightarrow 21AA\nhopf 1D559\nhorbar 2015\nhscr 1D4BD\nhslash 210F\n")
+    s.pushStr("hstrok 127\nhybull 2043\nhyphen 2010\niacute ED\nic 2063\nicirc EE\nicy 438\niecy 435\niexcl A1\n")
+    s.pushStr("iff 21D4\nifr 1D526\nigrave EC\nii 2148\niiiint 2A0C\niiint 222D\niinfin 29DC\niiota 2129\n")
+    s.pushStr("ijlig 133\nimacr 12B\nimage 2111\nimagline 2110\nimagpart 2111\nimath 131\nimof 22B7\n")
+    s.pushStr("imped 1B5\nin 2208\nincare 2105\ninfin 221E\ninfintie 29DD\ninodot 131\nint 222B\nintcal 22BA\n")
+    s.pushStr("integers 2124\nintercal 22BA\nintlarhk 2A17\nintprod 2A3C\niocy 451\niogon 12F\niopf 1D55A\n")
+    s.pushStr("iota 3B9\niprod 2A3C\niquest BF\niscr 1D4BE\nisin 2208\nisinE 22F9\nisindot 22F5\nisins 22F4\n")
+    s.pushStr("isinsv 22F3\nisinv 2208\nit 2062\nitilde 129\niukcy 456\niuml EF\njcirc 135\njcy 439\njfr 1D527\n")
+    s.pushStr("jmath 237\njopf 1D55B\njscr 1D4BF\njsercy 458\njukcy 454\nkappa 3BA\nkappav 3F0\nkcedil 137\n")
+    s.pushStr("kcy 43A\nkfr 1D528\nkgreen 138\nkhcy 445\nkjcy 45C\nkopf 1D55C\nkscr 1D4C0\nlAarr 21DA\n")
+    s.pushStr("lArr 21D0\nlAtail 291B\nlBarr 290E\nlE 2266\nlEg 2A8B\nlHar 2962\nlacute 13A\nlaemptyv 29B4\n")
+    s.pushStr("lagran 2112\nlambda 3BB\nlang 27E8\nlangd 2991\nlangle 27E8\nlap 2A85\nlaquo AB\nlarr 2190\n")
+    s.pushStr("larrb 21E4\nlarrbfs 291F\nlarrfs 291D\nlarrhk 21A9\nlarrlp 21AB\nlarrpl 2939\nlarrsim 2973\n")
+    s.pushStr("larrtl 21A2\nlat 2AAB\nlatail 2919\nlate 2AAD\nlates 2AAD FE00\nlbarr 290C\nlbbrk 2772\n")
+    s.pushStr("lbrace 7B\nlbrack 5B\nlbrke 298B\nlbrksld 298F\nlbrkslu 298D\nlcaron 13E\nlcedil 13C\n")
+    s.pushStr("lceil 2308\nlcub 7B\nlcy 43B\nldca 2936\nldquo 201C\nldquor 201E\nldrdhar 2967\nldrushar 294B\n")
+    s.pushStr("ldsh 21B2\nle 2264\nleftarrow 2190\nleftarrowtail 21A2\nleftharpoondown 21BD\n")
+    s.pushStr("leftharpoonup 21BC\nleftleftarrows 21C7\nleftrightarrow 2194\nleftrightarrows 21C6\n")
+    s.pushStr("leftrightharpoons 21CB\nleftrightsquigarrow 21AD\nleftthreetimes 22CB\nleg 22DA\nleq 2264\n")
+    s.pushStr("leqq 2266\nleqslant 2A7D\nles 2A7D\nlescc 2AA8\nlesdot 2A7F\nlesdoto 2A81\nlesdotor 2A83\n")
+    s.pushStr("lesg 22DA FE00\nlesges 2A93\nlessapprox 2A85\nlessdot 22D6\nlesseqgtr 22DA\nlesseqqgtr 2A8B\n")
+    s.pushStr("lessgtr 2276\nlesssim 2272\nlfisht 297C\nlfloor 230A\nlfr 1D529\nlg 2276\nlgE 2A91\nlhard 21BD\n")
+    s.pushStr("lharu 21BC\nlharul 296A\nlhblk 2584\nljcy 459\nll 226A\nllarr 21C7\nllcorner 231E\nllhard 296B\n")
+    s.pushStr("lltri 25FA\nlmidot 140\nlmoust 23B0\nlmoustache 23B0\nlnE 2268\nlnap 2A89\nlnapprox 2A89\n")
+    s.pushStr("lne 2A87\nlneq 2A87\nlneqq 2268\nlnsim 22E6\nloang 27EC\nloarr 21FD\nlobrk 27E6\n")
+    s.pushStr("longleftarrow 27F5\nlongleftrightarrow 27F7\nlongmapsto 27FC\nlongrightarrow 27F6\n")
+    s.pushStr("looparrowleft 21AB\nlooparrowright 21AC\nlopar 2985\nlopf 1D55D\nloplus 2A2D\nlotimes 2A34\n")
+    s.pushStr("lowast 2217\nlowbar 5F\nloz 25CA\nlozenge 25CA\nlozf 29EB\nlpar 28\nlparlt 2993\nlrarr 21C6\n")
+    s.pushStr("lrcorner 231F\nlrhar 21CB\nlrhard 296D\nlrm 200E\nlrtri 22BF\nlsaquo 2039\nlscr 1D4C1\n")
+    s.pushStr("lsh 21B0\nlsim 2272\nlsime 2A8D\nlsimg 2A8F\nlsqb 5B\nlsquo 2018\nlsquor 201A\nlstrok 142\n")
+    s.pushStr("lt 3C\nltcc 2AA6\nltcir 2A79\nltdot 22D6\nlthree 22CB\nltimes 22C9\nltlarr 2976\nltquest 2A7B\n")
+    s.pushStr("ltrPar 2996\nltri 25C3\nltrie 22B4\nltrif 25C2\nlurdshar 294A\nluruhar 2966\n")
+    s.pushStr("lvertneqq 2268 FE00\nlvnE 2268 FE00\nmDDot 223A\nmacr AF\nmale 2642\nmalt 2720\nmaltese 2720\n")
+    s.pushStr("map 21A6\nmapsto 21A6\nmapstodown 21A7\nmapstoleft 21A4\nmapstoup 21A5\nmarker 25AE\n")
+    s.pushStr("mcomma 2A29\nmcy 43C\nmdash 2014\nmeasuredangle 2221\nmfr 1D52A\nmho 2127\nmicro B5\nmid 2223\n")
+    s.pushStr("midast 2A\nmidcir 2AF0\nmiddot B7\nminus 2212\nminusb 229F\nminusd 2238\nminusdu 2A2A\n")
+    s.pushStr("mlcp 2ADB\nmldr 2026\nmnplus 2213\nmodels 22A7\nmopf 1D55E\nmp 2213\nmscr 1D4C2\nmstpos 223E\n")
+    s.pushStr("mu 3BC\nmultimap 22B8\nmumap 22B8\nnGg 22D9 338\nnGt 226B 20D2\nnGtv 226B 338\n")
+    s.pushStr("nLeftarrow 21CD\nnLeftrightarrow 21CE\nnLl 22D8 338\nnLt 226A 20D2\nnLtv 226A 338\n")
+    s.pushStr("nRightarrow 21CF\nnVDash 22AF\nnVdash 22AE\nnabla 2207\nnacute 144\nnang 2220 20D2\nnap 2249\n")
+    s.pushStr("napE 2A70 338\nnapid 224B 338\nnapos 149\nnapprox 2249\nnatur 266E\nnatural 266E\n")
+    s.pushStr("naturals 2115\nnbsp A0\nnbump 224E 338\nnbumpe 224F 338\nncap 2A43\nncaron 148\nncedil 146\n")
+    s.pushStr("ncong 2247\nncongdot 2A6D 338\nncup 2A42\nncy 43D\nndash 2013\nne 2260\nneArr 21D7\n")
+    s.pushStr("nearhk 2924\nnearr 2197\nnearrow 2197\nnedot 2250 338\nnequiv 2262\nnesear 2928\n")
+    s.pushStr("nesim 2242 338\nnexist 2204\nnexists 2204\nnfr 1D52B\nngE 2267 338\nnge 2271\nngeq 2271\n")
+    s.pushStr("ngeqq 2267 338\nngeqslant 2A7E 338\nnges 2A7E 338\nngsim 2275\nngt 226F\nngtr 226F\n")
+    s.pushStr("nhArr 21CE\nnharr 21AE\nnhpar 2AF2\nni 220B\nnis 22FC\nnisd 22FA\nniv 220B\nnjcy 45A\n")
+    s.pushStr("nlArr 21CD\nnlE 2266 338\nnlarr 219A\nnldr 2025\nnle 2270\nnleftarrow 219A\n")
+    s.pushStr("nleftrightarrow 21AE\nnleq 2270\nnleqq 2266 338\nnleqslant 2A7D 338\nnles 2A7D 338\n")
+    s.pushStr("nless 226E\nnlsim 2274\nnlt 226E\nnltri 22EA\nnltrie 22EC\nnmid 2224\nnopf 1D55F\nnot AC\n")
+    s.pushStr("notin 2209\nnotinE 22F9 338\nnotindot 22F5 338\nnotinva 2209\nnotinvb 22F7\nnotinvc 22F6\n")
+    s.pushStr("notni 220C\nnotniva 220C\nnotnivb 22FE\nnotnivc 22FD\nnpar 2226\nnparallel 2226\n")
+    s.pushStr("nparsl 2AFD 20E5\nnpart 2202 338\nnpolint 2A14\nnpr 2280\nnprcue 22E0\nnpre 2AAF 338\n")
+    s.pushStr("nprec 2280\nnpreceq 2AAF 338\nnrArr 21CF\nnrarr 219B\nnrarrc 2933 338\nnrarrw 219D 338\n")
+    s.pushStr("nrightarrow 219B\nnrtri 22EB\nnrtrie 22ED\nnsc 2281\nnsccue 22E1\nnsce 2AB0 338\nnscr 1D4C3\n")
+    s.pushStr("nshortmid 2224\nnshortparallel 2226\nnsim 2241\nnsime 2244\nnsimeq 2244\nnsmid 2224\n")
+    s.pushStr("nspar 2226\nnsqsube 22E2\nnsqsupe 22E3\nnsub 2284\nnsubE 2AC5 338\nnsube 2288\n")
+    s.pushStr("nsubset 2282 20D2\nnsubseteq 2288\nnsubseteqq 2AC5 338\nnsucc 2281\nnsucceq 2AB0 338\n")
+    s.pushStr("nsup 2285\nnsupE 2AC6 338\nnsupe 2289\nnsupset 2283 20D2\nnsupseteq 2289\n")
+    s.pushStr("nsupseteqq 2AC6 338\nntgl 2279\nntilde F1\nntlg 2278\nntriangleleft 22EA\n")
+    s.pushStr("ntrianglelefteq 22EC\nntriangleright 22EB\nntrianglerighteq 22ED\nnu 3BD\nnum 23\n")
+    s.pushStr("numero 2116\nnumsp 2007\nnvDash 22AD\nnvHarr 2904\nnvap 224D 20D2\nnvdash 22AC\n")
+    s.pushStr("nvge 2265 20D2\nnvgt 3E 20D2\nnvinfin 29DE\nnvlArr 2902\nnvle 2264 20D2\nnvlt 3C 20D2\n")
+    s.pushStr("nvltrie 22B4 20D2\nnvrArr 2903\nnvrtrie 22B5 20D2\nnvsim 223C 20D2\nnwArr 21D6\nnwarhk 2923\n")
+    s.pushStr("nwarr 2196\nnwarrow 2196\nnwnear 2927\noS 24C8\noacute F3\noast 229B\nocir 229A\nocirc F4\n")
+    s.pushStr("ocy 43E\nodash 229D\nodblac 151\nodiv 2A38\nodot 2299\nodsold 29BC\noelig 153\nofcir 29BF\n")
+    s.pushStr("ofr 1D52C\nogon 2DB\nograve F2\nogt 29C1\nohbar 29B5\nohm 3A9\noint 222E\nolarr 21BA\n")
+    s.pushStr("olcir 29BE\nolcross 29BB\noline 203E\nolt 29C0\nomacr 14D\nomega 3C9\nomicron 3BF\nomid 29B6\n")
+    s.pushStr("ominus 2296\noopf 1D560\nopar 29B7\noperp 29B9\noplus 2295\nor 2228\norarr 21BB\nord 2A5D\n")
+    s.pushStr("order 2134\norderof 2134\nordf AA\nordm BA\norigof 22B6\noror 2A56\norslope 2A57\norv 2A5B\n")
+    s.pushStr("oscr 2134\noslash F8\nosol 2298\notilde F5\notimes 2297\notimesas 2A36\nouml F6\novbar 233D\n")
+    s.pushStr("par 2225\npara B6\nparallel 2225\nparsim 2AF3\nparsl 2AFD\npart 2202\npcy 43F\npercnt 25\n")
+    s.pushStr("period 2E\npermil 2030\nperp 22A5\npertenk 2031\npfr 1D52D\nphi 3C6\nphiv 3D5\nphmmat 2133\n")
+    s.pushStr("phone 260E\npi 3C0\npitchfork 22D4\npiv 3D6\nplanck 210F\nplanckh 210E\nplankv 210F\nplus 2B\n")
+    s.pushStr("plusacir 2A23\nplusb 229E\npluscir 2A22\nplusdo 2214\nplusdu 2A25\npluse 2A72\nplusmn B1\n")
+    s.pushStr("plussim 2A26\nplustwo 2A27\npm B1\npointint 2A15\npopf 1D561\npound A3\npr 227A\nprE 2AB3\n")
+    s.pushStr("prap 2AB7\nprcue 227C\npre 2AAF\nprec 227A\nprecapprox 2AB7\npreccurlyeq 227C\npreceq 2AAF\n")
+    s.pushStr("precnapprox 2AB9\nprecneqq 2AB5\nprecnsim 22E8\nprecsim 227E\nprime 2032\nprimes 2119\n")
+    s.pushStr("prnE 2AB5\nprnap 2AB9\nprnsim 22E8\nprod 220F\nprofalar 232E\nprofline 2312\nprofsurf 2313\n")
+    s.pushStr("prop 221D\npropto 221D\nprsim 227E\nprurel 22B0\npscr 1D4C5\npsi 3C8\npuncsp 2008\nqfr 1D52E\n")
+    s.pushStr("qint 2A0C\nqopf 1D562\nqprime 2057\nqscr 1D4C6\nquaternions 210D\nquatint 2A16\nquest 3F\n")
+    s.pushStr("questeq 225F\nquot 22\nrAarr 21DB\nrArr 21D2\nrAtail 291C\nrBarr 290F\nrHar 2964\n")
+    s.pushStr("race 223D 331\nracute 155\nradic 221A\nraemptyv 29B3\nrang 27E9\nrangd 2992\nrange 29A5\n")
+    s.pushStr("rangle 27E9\nraquo BB\nrarr 2192\nrarrap 2975\nrarrb 21E5\nrarrbfs 2920\nrarrc 2933\n")
+    s.pushStr("rarrfs 291E\nrarrhk 21AA\nrarrlp 21AC\nrarrpl 2945\nrarrsim 2974\nrarrtl 21A3\nrarrw 219D\n")
+    s.pushStr("ratail 291A\nratio 2236\nrationals 211A\nrbarr 290D\nrbbrk 2773\nrbrace 7D\nrbrack 5D\n")
+    s.pushStr("rbrke 298C\nrbrksld 298E\nrbrkslu 2990\nrcaron 159\nrcedil 157\nrceil 2309\nrcub 7D\nrcy 440\n")
+    s.pushStr("rdca 2937\nrdldhar 2969\nrdquo 201D\nrdquor 201D\nrdsh 21B3\nreal 211C\nrealine 211B\n")
+    s.pushStr("realpart 211C\nreals 211D\nrect 25AD\nreg AE\nrfisht 297D\nrfloor 230B\nrfr 1D52F\nrhard 21C1\n")
+    s.pushStr("rharu 21C0\nrharul 296C\nrho 3C1\nrhov 3F1\nrightarrow 2192\nrightarrowtail 21A3\n")
+    s.pushStr("rightharpoondown 21C1\nrightharpoonup 21C0\nrightleftarrows 21C4\nrightleftharpoons 21CC\n")
+    s.pushStr("rightrightarrows 21C9\nrightsquigarrow 219D\nrightthreetimes 22CC\nring 2DA\n")
+    s.pushStr("risingdotseq 2253\nrlarr 21C4\nrlhar 21CC\nrlm 200F\nrmoust 23B1\nrmoustache 23B1\nrnmid 2AEE\n")
+    s.pushStr("roang 27ED\nroarr 21FE\nrobrk 27E7\nropar 2986\nropf 1D563\nroplus 2A2E\nrotimes 2A35\nrpar 29\n")
+    s.pushStr("rpargt 2994\nrppolint 2A12\nrrarr 21C9\nrsaquo 203A\nrscr 1D4C7\nrsh 21B1\nrsqb 5D\nrsquo 2019\n")
+    s.pushStr("rsquor 2019\nrthree 22CC\nrtimes 22CA\nrtri 25B9\nrtrie 22B5\nrtrif 25B8\nrtriltri 29CE\n")
+    s.pushStr("ruluhar 2968\nrx 211E\nsacute 15B\nsbquo 201A\nsc 227B\nscE 2AB4\nscap 2AB8\nscaron 161\n")
+    s.pushStr("sccue 227D\nsce 2AB0\nscedil 15F\nscirc 15D\nscnE 2AB6\nscnap 2ABA\nscnsim 22E9\nscpolint 2A13\n")
+    s.pushStr("scsim 227F\nscy 441\nsdot 22C5\nsdotb 22A1\nsdote 2A66\nseArr 21D8\nsearhk 2925\nsearr 2198\n")
+    s.pushStr("searrow 2198\nsect A7\nsemi 3B\nseswar 2929\nsetminus 2216\nsetmn 2216\nsext 2736\nsfr 1D530\n")
+    s.pushStr("sfrown 2322\nsharp 266F\nshchcy 449\nshcy 448\nshortmid 2223\nshortparallel 2225\nshy AD\n")
+    s.pushStr("sigma 3C3\nsigmaf 3C2\nsigmav 3C2\nsim 223C\nsimdot 2A6A\nsime 2243\nsimeq 2243\nsimg 2A9E\n")
+    s.pushStr("simgE 2AA0\nsiml 2A9D\nsimlE 2A9F\nsimne 2246\nsimplus 2A24\nsimrarr 2972\nslarr 2190\n")
+    s.pushStr("smallsetminus 2216\nsmashp 2A33\nsmeparsl 29E4\nsmid 2223\nsmile 2323\nsmt 2AAA\nsmte 2AAC\n")
+    s.pushStr("smtes 2AAC FE00\nsoftcy 44C\nsol 2F\nsolb 29C4\nsolbar 233F\nsopf 1D564\nspades 2660\n")
+    s.pushStr("spadesuit 2660\nspar 2225\nsqcap 2293\nsqcaps 2293 FE00\nsqcup 2294\nsqcups 2294 FE00\n")
+    s.pushStr("sqsub 228F\nsqsube 2291\nsqsubset 228F\nsqsubseteq 2291\nsqsup 2290\nsqsupe 2292\n")
+    s.pushStr("sqsupset 2290\nsqsupseteq 2292\nsqu 25A1\nsquare 25A1\nsquarf 25AA\nsquf 25AA\nsrarr 2192\n")
+    s.pushStr("sscr 1D4C8\nssetmn 2216\nssmile 2323\nsstarf 22C6\nstar 2606\nstarf 2605\nstraightepsilon 3F5\n")
+    s.pushStr("straightphi 3D5\nstrns AF\nsub 2282\nsubE 2AC5\nsubdot 2ABD\nsube 2286\nsubedot 2AC3\n")
+    s.pushStr("submult 2AC1\nsubnE 2ACB\nsubne 228A\nsubplus 2ABF\nsubrarr 2979\nsubset 2282\nsubseteq 2286\n")
+    s.pushStr("subseteqq 2AC5\nsubsetneq 228A\nsubsetneqq 2ACB\nsubsim 2AC7\nsubsub 2AD5\nsubsup 2AD3\n")
+    s.pushStr("succ 227B\nsuccapprox 2AB8\nsucccurlyeq 227D\nsucceq 2AB0\nsuccnapprox 2ABA\nsuccneqq 2AB6\n")
+    s.pushStr("succnsim 22E9\nsuccsim 227F\nsum 2211\nsung 266A\nsup 2283\nsup1 B9\nsup2 B2\nsup3 B3\n")
+    s.pushStr("supE 2AC6\nsupdot 2ABE\nsupdsub 2AD8\nsupe 2287\nsupedot 2AC4\nsuphsol 27C9\nsuphsub 2AD7\n")
+    s.pushStr("suplarr 297B\nsupmult 2AC2\nsupnE 2ACC\nsupne 228B\nsupplus 2AC0\nsupset 2283\nsupseteq 2287\n")
+    s.pushStr("supseteqq 2AC6\nsupsetneq 228B\nsupsetneqq 2ACC\nsupsim 2AC8\nsupsub 2AD4\nsupsup 2AD6\n")
+    s.pushStr("swArr 21D9\nswarhk 2926\nswarr 2199\nswarrow 2199\nswnwar 292A\nszlig DF\ntarget 2316\ntau 3C4\n")
+    s.pushStr("tbrk 23B4\ntcaron 165\ntcedil 163\ntcy 442\ntdot 20DB\ntelrec 2315\ntfr 1D531\nthere4 2234\n")
+    s.pushStr("therefore 2234\ntheta 3B8\nthetasym 3D1\nthetav 3D1\nthickapprox 2248\nthicksim 223C\n")
+    s.pushStr("thinsp 2009\nthkap 2248\nthksim 223C\nthorn FE\ntilde 2DC\ntimes D7\ntimesb 22A0\n")
+    s.pushStr("timesbar 2A31\ntimesd 2A30\ntint 222D\ntoea 2928\ntop 22A4\ntopbot 2336\ntopcir 2AF1\n")
+    s.pushStr("topf 1D565\ntopfork 2ADA\ntosa 2929\ntprime 2034\ntrade 2122\ntriangle 25B5\n")
+    s.pushStr("triangledown 25BF\ntriangleleft 25C3\ntrianglelefteq 22B4\ntriangleq 225C\n")
+    s.pushStr("triangleright 25B9\ntrianglerighteq 22B5\ntridot 25EC\ntrie 225C\ntriminus 2A3A\n")
+    s.pushStr("triplus 2A39\ntrisb 29CD\ntritime 2A3B\ntrpezium 23E2\ntscr 1D4C9\ntscy 446\ntshcy 45B\n")
+    s.pushStr("tstrok 167\ntwixt 226C\ntwoheadleftarrow 219E\ntwoheadrightarrow 21A0\nuArr 21D1\nuHar 2963\n")
+    s.pushStr("uacute FA\nuarr 2191\nubrcy 45E\nubreve 16D\nucirc FB\nucy 443\nudarr 21C5\nudblac 171\n")
+    s.pushStr("udhar 296E\nufisht 297E\nufr 1D532\nugrave F9\nuharl 21BF\nuharr 21BE\nuhblk 2580\nulcorn 231C\n")
+    s.pushStr("ulcorner 231C\nulcrop 230F\nultri 25F8\numacr 16B\numl A8\nuogon 173\nuopf 1D566\nuparrow 2191\n")
+    s.pushStr("updownarrow 2195\nupharpoonleft 21BF\nupharpoonright 21BE\nuplus 228E\nupsi 3C5\nupsih 3D2\n")
+    s.pushStr("upsilon 3C5\nupuparrows 21C8\nurcorn 231D\nurcorner 231D\nurcrop 230E\nuring 16F\nurtri 25F9\n")
+    s.pushStr("uscr 1D4CA\nutdot 22F0\nutilde 169\nutri 25B5\nutrif 25B4\nuuarr 21C8\nuuml FC\nuwangle 29A7\n")
+    s.pushStr("vArr 21D5\nvBar 2AE8\nvBarv 2AE9\nvDash 22A8\nvangrt 299C\nvarepsilon 3F5\nvarkappa 3F0\n")
+    s.pushStr("varnothing 2205\nvarphi 3D5\nvarpi 3D6\nvarpropto 221D\nvarr 2195\nvarrho 3F1\nvarsigma 3C2\n")
+    s.pushStr("varsubsetneq 228A FE00\nvarsubsetneqq 2ACB FE00\nvarsupsetneq 228B FE00\n")
+    s.pushStr("varsupsetneqq 2ACC FE00\nvartheta 3D1\nvartriangleleft 22B2\nvartriangleright 22B3\nvcy 432\n")
+    s.pushStr("vdash 22A2\nvee 2228\nveebar 22BB\nveeeq 225A\nvellip 22EE\nverbar 7C\nvert 7C\nvfr 1D533\n")
+    s.pushStr("vltri 22B2\nvnsub 2282 20D2\nvnsup 2283 20D2\nvopf 1D567\nvprop 221D\nvrtri 22B3\nvscr 1D4CB\n")
+    s.pushStr("vsubnE 2ACB FE00\nvsubne 228A FE00\nvsupnE 2ACC FE00\nvsupne 228B FE00\nvzigzag 299A\n")
+    s.pushStr("wcirc 175\nwedbar 2A5F\nwedge 2227\nwedgeq 2259\nweierp 2118\nwfr 1D534\nwopf 1D568\nwp 2118\n")
+    s.pushStr("wr 2240\nwreath 2240\nwscr 1D4CC\nxcap 22C2\nxcirc 25EF\nxcup 22C3\nxdtri 25BD\nxfr 1D535\n")
+    s.pushStr("xhArr 27FA\nxharr 27F7\nxi 3BE\nxlArr 27F8\nxlarr 27F5\nxmap 27FC\nxnis 22FB\nxodot 2A00\n")
+    s.pushStr("xopf 1D569\nxoplus 2A01\nxotime 2A02\nxrArr 27F9\nxrarr 27F6\nxscr 1D4CD\nxsqcup 2A06\n")
+    s.pushStr("xuplus 2A04\nxutri 25B3\nxvee 22C1\nxwedge 22C0\nyacute FD\nyacy 44F\nycirc 177\nycy 44B\n")
+    s.pushStr("yen A5\nyfr 1D536\nyicy 457\nyopf 1D56A\nyscr 1D4CE\nyucy 44E\nyuml FF\nzacute 17A\nzcaron 17E\n")
+    s.pushStr("zcy 437\nzdot 17C\nzeetrf 2128\nzeta 3B6\nzfr 1D537\nzhcy 436\nzigrarr 21DD\nzopf 1D56B\n")
+    s.pushStr("zscr 1D4CF\nzwj 200D\nzwnj 200C\n")
+    return s
+}
