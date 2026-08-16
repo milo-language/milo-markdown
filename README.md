@@ -4,31 +4,15 @@ This is a package for the [Milo language](https://milo-language.github.io/milo/)
 
 ## Overview
 
-A CommonMark 0.31.2 + GFM parser and HTML renderer, with no dependencies beyond
-the standard library. 653 of the 655 CommonMark spec examples pass, and
-rendering the 206 KB spec document itself produces output byte-identical to
-`cmark 0.31.2`.
+Parse markdown and render it to HTML. Implements CommonMark 0.31.2 plus GFM.
 
-A document parses into a flat pool of nodes. Every node is an `i64` handle into
-that pool, and **-1 means "not there"**, so a walk that misses is not an error:
-`doc.text(doc.at(doc.root(), 99))` is `""`, with no bounds check at the call
-site. The pool rather than a recursive enum is deliberate — Milo has no pointers
-in safe code, so a self-referential value type would need an arena anyway, and
-indices make the whole document one contiguous, cheaply-cloned value.
+The parsed tree is public too, so you can walk it yourself: pull out headings,
+check links, find raw HTML.
 
-The tree is the product, not just the renderer's scratch space. `toHtml` is one
-consumer of it: a docs generator pulls `Heading` nodes out, a link checker walks
-`Link`/`Image` nodes for their `dest`, a linter refuses raw HTML by looking for
-`HtmlBlock`. Anything the renderer can see, a caller can see.
+One thing to know: raw HTML in the source reaches the output verbatim, because
+CommonMark says it does. This is a parser, not a sanitizer.
 
-**Raw HTML in the source is emitted verbatim, because CommonMark says it is.**
-`<script>alert(1)</script>` in the input reaches the output. Text, code and
-attribute values *are* escaped on the way out, and URLs in `href`/`src` are
-percent-encoded so a destination cannot close the attribute — but this package
-is a parser, not a sanitizer, and no option here makes attacker-supplied HTML
-safe. See the third example below.
-
-Every function and method: [docs/api.md](docs/api.md).
+Full API, conformance numbers and the not-implemented list: [docs/api.md](docs/api.md).
 
 ## Installation
 
