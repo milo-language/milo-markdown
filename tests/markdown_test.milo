@@ -167,7 +167,7 @@ fn testTreeWalkLinks() {
     // What a link checker does: collect every destination, at any depth.
     let doc = Markdown.parse("[a](/one)\n\n> - [b](/two \"t\")\n>   ![c](/three)\n")
     var found = ""
-    collectLinks(doc, doc.root(), found)
+    collectLinks(doc, doc.root(), &mut found)
     assertStrEqual(found, "/one|/two|/three|")
     let link = doc.at(doc.at(doc.root(), 0), 0)
     assertStrEqual(doc.dest(link), "/one")
@@ -181,7 +181,7 @@ fn collectLinks(doc: &Markdown, node: i64, out: &mut string) {
         out.push('|')
     }
     for i in 0..doc.len(node) {
-        collectLinks(doc, doc.at(node, i), out)
+        collectLinks(doc, doc.at(node, i), &mut out)
     }
 }
 

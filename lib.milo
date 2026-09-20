@@ -312,7 +312,7 @@ impl Markdown {
     // what the renderer uses for an image's alt text.
     fn innerText(self: &Self, node: i64): string {
         var out = ""
-        self.innerTextInto(node, out)
+        self.innerTextInto(node, &mut out)
         return out
     }
 
@@ -331,7 +331,7 @@ impl Markdown {
             out.push('\n')
         }
         for i in 0..self.nodes[node].childCount {
-            self.innerTextInto(self.childIdx[self.nodes[node].childStart + i], out)
+            self.innerTextInto(self.childIdx[self.nodes[node].childStart + i], &mut out)
         }
     }
 }
@@ -559,7 +559,7 @@ fn isUnicodePunctCp(cp: i32): bool {
 
 pub fn escapeHtml(s: &string): string {
     var out = ""
-    escapeHtmlInto(s, out)
+    escapeHtmlInto(s, &mut out)
     return out
 }
 
@@ -1926,7 +1926,7 @@ fn mdSplitLines(src: &string): Vec<string> {
                 i = i + 1
             }
         } else if c == 0 {
-            encodeCodepoint(cur, 65533)
+            encodeCodepoint(&mut cur, 65533)
             i = i + 1
         } else {
             cur.push(c)
@@ -3534,7 +3534,7 @@ fn decodeEntityRef(raw: &string): string {
             value = 65533
         }
         var out = ""
-        encodeCodepoint(out, value as i32)
+        encodeCodepoint(&mut out, value as i32)
         return out
     }
     let name = raw.substr(1, raw.len - 1)
@@ -3561,7 +3561,7 @@ fn namedEntityValue(name: &string): string {
                 }
                 if c == ' ' {
                     if have {
-                        encodeCodepoint(out, cp as i32)
+                        encodeCodepoint(&mut out, cp as i32)
                     }
                     cp = 0
                     have = false
@@ -3573,7 +3573,7 @@ fn namedEntityValue(name: &string): string {
                 i = i + 1
             }
             if have {
-                encodeCodepoint(out, cp as i32)
+                encodeCodepoint(&mut out, cp as i32)
             }
             return out
         }
@@ -3622,7 +3622,7 @@ fn foldCaseCp(out: &mut string, cp: i32): void {
     } else if cp >= 1024 && cp <= 1039 {
         folded = cp + 80
     }
-    encodeCodepoint(out, folded)
+    encodeCodepoint(&mut out, folded)
 }
 
 // A reference label matches with runs of whitespace collapsed and case folded.
@@ -3641,7 +3641,7 @@ fn normalizeReference(label: &string): string {
                 prevSpace = true
             }
         } else {
-            foldCaseCp(out, cp)
+            foldCaseCp(&mut out, cp)
             prevSpace = false
         }
     }
@@ -3665,7 +3665,7 @@ impl Markdown {
     // Render the whole document to HTML.
     fn toHtml(self: &Self): string {
         var out = ""
-        self.renderChildren(self.root, out, false)
+        self.renderChildren(self.root, &mut out, false)
         return out
     }
 
@@ -3674,7 +3674,7 @@ impl Markdown {
         let n = self.nodes[node].childCount
         while i < n {
             let c = self.childIdx[self.nodes[node].childStart + i]
-            self.renderNode(c, out, tight)
+            self.renderNode(c, &mut out, tight)
             i = i + 1
         }
     }
@@ -3683,47 +3683,47 @@ impl Markdown {
         let k = self.nodes[node].kind
 
         if isKind(k, NodeKind.Document) {
-            self.renderChildren(node, out, false)
+            self.renderChildren(node, &mut out, false)
             return
         }
         if isKind(k, NodeKind.Paragraph) {
             if tight {
-                self.renderChildren(node, out, false)
+                self.renderChildren(node, &mut out, false)
                 return
             }
-            cr(out)
+            cr(&mut out)
             out.pushStr("<p>")
-            self.renderChildren(node, out, false)
+            self.renderChildren(node, &mut out, false)
             out.pushStr("</p>\n")
             return
         }
         if isKind(k, NodeKind.Heading) {
-            cr(out)
+            cr(&mut out)
             let lvl = self.nodes[node].level
             out.pushStr("<h")
             out.push(('0' as i64 + lvl) as u8)
             out.push('>')
-            self.renderChildren(node, out, false)
+            self.renderChildren(node, &mut out, false)
             out.pushStr("</h")
             out.push(('0' as i64 + lvl) as u8)
             out.pushStr(">\n")
             return
         }
         if isKind(k, NodeKind.ThematicBreak) {
-            cr(out)
+            cr(&mut out)
             out.pushStr("<hr />\n")
             return
         }
         if isKind(k, NodeKind.BlockQuote) {
-            cr(out)
+            cr(&mut out)
             out.pushStr("<blockquote>\n")
-            self.renderChildren(node, out, false)
-            cr(out)
+            self.renderChildren(node, &mut out, false)
+            cr(&mut out)
             out.pushStr("</blockquote>\n")
             return
         }
         if isKind(k, NodeKind.List) {
-            cr(out)
+            cr(&mut out)
             let isTight = self.nodes[node].listTight
             if self.nodes[node].listOrdered {
                 out.pushStr("<ol")
@@ -3734,19 +3734,19 @@ impl Markdown {
                     out.push('"')
                 }
                 out.pushStr(">\n")
-                self.renderChildren(node, out, isTight)
-                cr(out)
+                self.renderChildren(node, &mut out, isTight)
+                cr(&mut out)
                 out.pushStr("</ol>\n")
             } else {
                 out.pushStr("<ul>\n")
-                self.renderChildren(node, out, isTight)
-                cr(out)
+                self.renderChildren(node, &mut out, isTight)
+                cr(&mut out)
                 out.pushStr("</ul>\n")
             }
             return
         }
         if isKind(k, NodeKind.Item) {
-            cr(out)
+            cr(&mut out)
             out.pushStr("<li>")
             if self.nodes[node].taskState != 0 {
                 // GFM renders the checkbox as a disabled input before the
@@ -3757,12 +3757,12 @@ impl Markdown {
                     out.pushStr("<input type=\"checkbox\" disabled=\"\" /> ")
                 }
             }
-            self.renderChildren(node, out, tight)
+            self.renderChildren(node, &mut out, tight)
             out.pushStr("</li>\n")
             return
         }
         if isKind(k, NodeKind.CodeBlock) {
-            cr(out)
+            cr(&mut out)
             out.pushStr("<pre><code")
             let info = self.nodes[node].dest.clone()
             if info.len > 0 {
@@ -3773,22 +3773,22 @@ impl Markdown {
                 }
                 let lang = info.substr(0, end)
                 out.pushStr(" class=\"language-")
-                escapeHtmlInto(lang, out)
+                escapeHtmlInto(lang, &mut out)
                 out.push('"')
             }
             out.push('>')
-            escapeHtmlInto(self.nodes[node].literal, out)
+            escapeHtmlInto(self.nodes[node].literal, &mut out)
             out.pushStr("</code></pre>\n")
             return
         }
         if isKind(k, NodeKind.HtmlBlock) {
-            cr(out)
+            cr(&mut out)
             out.pushStr(self.nodes[node].literal)
-            cr(out)
+            cr(&mut out)
             return
         }
         if isKind(k, NodeKind.Text) {
-            escapeHtmlInto(self.nodes[node].literal, out)
+            escapeHtmlInto(self.nodes[node].literal, &mut out)
             return
         }
         if isKind(k, NodeKind.SoftBreak) {
@@ -3801,7 +3801,7 @@ impl Markdown {
         }
         if isKind(k, NodeKind.Code) {
             out.pushStr("<code>")
-            escapeHtmlInto(self.nodes[node].literal, out)
+            escapeHtmlInto(self.nodes[node].literal, &mut out)
             out.pushStr("</code>")
             return
         }
@@ -3811,53 +3811,53 @@ impl Markdown {
         }
         if isKind(k, NodeKind.Emph) {
             out.pushStr("<em>")
-            self.renderChildren(node, out, false)
+            self.renderChildren(node, &mut out, false)
             out.pushStr("</em>")
             return
         }
         if isKind(k, NodeKind.Strong) {
             out.pushStr("<strong>")
-            self.renderChildren(node, out, false)
+            self.renderChildren(node, &mut out, false)
             out.pushStr("</strong>")
             return
         }
         if isKind(k, NodeKind.Strike) {
             out.pushStr("<del>")
-            self.renderChildren(node, out, false)
+            self.renderChildren(node, &mut out, false)
             out.pushStr("</del>")
             return
         }
         if isKind(k, NodeKind.Link) {
             out.pushStr("<a href=\"")
-            escapeHref(self.nodes[node].dest, out)
+            escapeHref(self.nodes[node].dest, &mut out)
             out.push('"')
             if self.nodes[node].title.len > 0 {
                 out.pushStr(" title=\"")
-                escapeHtmlInto(self.nodes[node].title, out)
+                escapeHtmlInto(self.nodes[node].title, &mut out)
                 out.push('"')
             }
             out.push('>')
-            self.renderChildren(node, out, false)
+            self.renderChildren(node, &mut out, false)
             out.pushStr("</a>")
             return
         }
         if isKind(k, NodeKind.Image) {
             out.pushStr("<img src=\"")
-            escapeHref(self.nodes[node].dest, out)
+            escapeHref(self.nodes[node].dest, &mut out)
             out.pushStr("\" alt=\"")
             let alt = self.innerText(node)
-            escapeHtmlInto(alt, out)
+            escapeHtmlInto(alt, &mut out)
             out.push('"')
             if self.nodes[node].title.len > 0 {
                 out.pushStr(" title=\"")
-                escapeHtmlInto(self.nodes[node].title, out)
+                escapeHtmlInto(self.nodes[node].title, &mut out)
                 out.push('"')
             }
             out.pushStr(" />")
             return
         }
         if isKind(k, NodeKind.Table) {
-            cr(out)
+            cr(&mut out)
             out.pushStr("<table>\n")
             let n = self.nodes[node].childCount
             var i: i64 = 0
@@ -3866,14 +3866,14 @@ impl Markdown {
                 let row = self.childIdx[self.nodes[node].childStart + i]
                 if self.nodes[row].isHeader {
                     out.pushStr("<thead>\n")
-                    self.renderNode(row, out, false)
+                    self.renderNode(row, &mut out, false)
                     out.pushStr("</thead>\n")
                 } else {
                     if !inBody {
                         out.pushStr("<tbody>\n")
                         inBody = true
                     }
-                    self.renderNode(row, out, false)
+                    self.renderNode(row, &mut out, false)
                 }
                 i = i + 1
             }
@@ -3885,7 +3885,7 @@ impl Markdown {
         }
         if isKind(k, NodeKind.TableRow) {
             out.pushStr("<tr>\n")
-            self.renderChildren(node, out, false)
+            self.renderChildren(node, &mut out, false)
             out.pushStr("</tr>\n")
             return
         }
@@ -3905,7 +3905,7 @@ impl Markdown {
                 out.pushStr(" align=\"right\"")
             }
             out.push('>')
-            self.renderChildren(node, out, false)
+            self.renderChildren(node, &mut out, false)
             out.pushStr("</")
             out.pushStr(tag)
             out.pushStr(">\n")
