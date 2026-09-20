@@ -1,6 +1,6 @@
 {
   "name": "markdown",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "CommonMark + GFM markdown parser and HTML renderer",
   "license": "MIT",
   "repository": "github.com/milo-language/milo-markdown",
