@@ -17,8 +17,8 @@ Full API, conformance numbers and the not-implemented list: [docs/api.md](docs/a
 ## Installation
 
 ```bash
-milo add github.com/milo-language/milo-markdown          # latest release
-milo add github.com/milo-language/milo-markdown@v0.1.0   # or pin a tag
+milo pkg add github.com/milo-language/milo-markdown          # latest release
+milo pkg add github.com/milo-language/milo-markdown@v0.1.0   # or pin a tag
 ```
 
 ```milo
